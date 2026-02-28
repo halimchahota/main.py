@@ -1,4 +1,4 @@
-main.pyimport requests
+import requests
 import time
 
 BOT_TOKEN = "8318064533:AAGQU-nfBnr4YHDMkETfvXoPNSmIE8GTmH8"
