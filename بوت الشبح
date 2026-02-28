@@ -1,0 +1,33 @@
+main.pyimport requests
+import time
+
+BOT_TOKEN = "8318064533:AAGQU-nfBnr4YHDMkETfvXoPNSmIE8GTmH8"
+CHAT_ID = "@abdel_tra"
+
+def get_gold_price():
+    url = "https://api.gold-api.com/price/XAU"
+    data = requests.get(url).json()
+    return data["price"]
+
+last_signal = None
+
+while True:
+    try:
+        price = get_gold_price()
+        print("Gold price:", price)
+
+        if price > 3326 and last_signal != "BUY":
+            message = f"🔵 BUY GOLD\nPrice: {price}"
+            requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={message}")
+            last_signal = "BUY"
+
+        elif price < 3313 and last_signal != "SELL":
+            message = f"🔴 SELL GOLD\nPrice: {price}"
+            requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={message}")
+            last_signal = "SELL"
+
+        time.sleep(60)
+
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(60)
