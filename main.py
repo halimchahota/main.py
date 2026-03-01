@@ -5,7 +5,7 @@ from requests.exceptions import RequestException
 from time import sleep
 
 # الأفضل وضعها في Railway Variables
-BOT_TOKEN = 8318064533:AAHlQa7lKoX6uYALYLJ9EbMX8QlNfnHoKgU
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "@abdel_tra")
 
 GOLD_PRICE_URL = "https://api.gold-api.com/price/XAU"
