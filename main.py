@@ -1,40 +1,32 @@
-import os
 import time
 import logging
 import requests
 from requests.exceptions import RequestException
 from time import sleep
 
-# Configuration from environment
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GOLD_PRICE_URL = os.getenv("GOLD_PRICE_URL", "https://api.gold-api.com/price/XAU")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
-BUY_THRESHOLD = float(os.getenv("BUY_THRESHOLD", "3326"))
-SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "3313"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+# TEMPORARY (insecure) embedded token and chat id as requested
+BOT_TOKEN = "8318064533:AAGQU-nfBnr4YHDMkETfvXoPNSmIE8GTmH8"
+CHAT_ID = "@abdel_tra"
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise SystemExit("Environment variables TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
+GOLD_PRICE_URL = "https://api.gold-api.com/price/XAU"
+CHECK_INTERVAL = 60
+BUY_THRESHOLD = 3326.0
+SELL_THRESHOLD = 3313.0
+REQUEST_TIMEOUT = 10
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 def get_gold_price():
     """Fetch the gold price JSON and return numeric price. Raises on failure."""
-    try:
-        resp = requests.get(GOLD_PRICE_URL, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        # Adjust this key if the API returns a different structure
-        if "price" in data:
-            return float(data["price")
-        # fallback checks for other common fields
-        for key in ("price_usd", "priceUSD", "value", "ask"):
-            if key in data:
-                return float(data[key])
-        raise ValueError("Price field not found in API response")
-    except (RequestException, ValueError):
-        raise
+    resp = requests.get(GOLD_PRICE_URL, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    if "price" in data:
+        return float(data["price"])
+    for key in ("price_usd", "priceUSD", "value", "ask"):
+        if key in data:
+            return float(data[key])
+    raise ValueError("Price field not found in API response")
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -65,13 +57,13 @@ def main():
                 if send_telegram_message(message):
                     last_signal = "SELL"
 
-            backoff = 1  # reset backoff on success
+            backoff = 1
             sleep(CHECK_INTERVAL)
 
         except Exception as e:
             logging.error("Error fetching price or sending message: %s", e)
             sleep(min(60, backoff))
-            backoff = min(300, backoff * 2)  # exponential backoff up to 5 minutes
+            backoff = min(300, backoff * 2)
 
 if __name__ == "__main__":
     main()
