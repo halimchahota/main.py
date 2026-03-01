@@ -5,7 +5,7 @@ from requests.exceptions import RequestException
 from time import sleep
 
 # TEMPORARY (insecure) embedded token and chat id as requested
-BOT_TOKEN = "8318064533:AAGQU-nfBnr4YHDMkETfvXoPNSmIE8GTmH8"
+BOT_TOKEN = "8318064533:AAHlQa7lKoX6uYALYLJ9EbMX8QlNfnHoKgU"
 CHAT_ID = "@abdel_tra"
 
 GOLD_PRICE_URL = "https://api.gold-api.com/price/XAU"
