@@ -18,7 +18,7 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
 ACCOUNT_USD = float(os.getenv("ACCOUNT_USD", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "0.03"))     # 3%
-MIN_SCORE = int(os.getenv("MIN_SCORE", "8"))        # 8/10
+MIN_SCORE = int(os.getenv("MIN_SCORE", "7"))        # 7/10
 
 SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))  # صغير لتقريب SL مثل 5$
 SR_LEVELS = int(os.getenv("SR_LEVELS", "10"))
