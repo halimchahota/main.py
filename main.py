@@ -8,7 +8,7 @@ import pandas as pd
 import yfinance as yf
 
 # =====================
-# RAILWAY ENV VARS
+# ENV
 # =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
@@ -16,24 +16,17 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "120"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
-# Risk management (Portfolio $100 default)
 ACCOUNT_USD = float(os.getenv("ACCOUNT_USD", "100"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.03"))  # 3%
-MIN_SCORE = int(os.getenv("MIN_SCORE", "8"))     # قوة الإشارة 8/10
+RISK_PCT = float(os.getenv("RISK_PCT", "0.03"))     # 3%
+MIN_SCORE = int(os.getenv("MIN_SCORE", "8"))        # 8/10
 
-# SL buffer using ATR
-SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.25"))
-
-# Fallback RR (if not enough S/R levels)
-RR_TP = [1.0, 2.0, 3.0]
-
-# how many SR levels to keep
-SR_LEVELS = int(os.getenv("SR_LEVELS", "6"))
-
-# Dedup + cooldown
+SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))  # صغير لتقريب SL مثل 5$
+SR_LEVELS = int(os.getenv("SR_LEVELS", "10"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
-# Optional offsets to better match broker quotes
+# فلتر: لا ترسل pending إذا entry بعيد عن السعر الحالي
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.5"))
+
 OFFSETS = {
     "XAU": float(os.getenv("XAU_OFFSET", "0")),
     "BTC": float(os.getenv("BTC_OFFSET", "0")),
@@ -42,7 +35,6 @@ OFFSETS = {
     "OIL": float(os.getenv("OIL_OFFSET", "0")),
 }
 
-# Max SL distance filter (important for $100 account)
 MAX_SL_DISTANCE = {
     "XAU": float(os.getenv("XAU_MAX_SL", "12")),
     "BTC": float(os.getenv("BTC_MAX_SL", "800")),
@@ -51,16 +43,14 @@ MAX_SL_DISTANCE = {
     "OIL": float(os.getenv("OIL_MAX_SL", "2.5")),
 }
 
-# Default Yahoo symbols (can change via Variables)
 SYMBOLS = {
-    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),      # Gold futures
+    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
     "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
-    "US100": os.getenv("US100_SYMBOL", "NQ=F"),  # Nasdaq futures
-    "US30": os.getenv("US30_SYMBOL", "^DJI"),    # Dow Jones
-    "OIL": os.getenv("OIL_SYMBOL", "CL=F"),      # Crude oil futures
+    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
+    "US30": os.getenv("US30_SYMBOL", "^DJI"),
+    "OIL": os.getenv("OIL_SYMBOL", "CL=F"),
 }
 
-# Period/interval per timeframe
 TF_MAP = {
     "D1": ("120d", "1d"),
     "H4": ("60d", "4h"),
@@ -72,16 +62,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 
 
 # =====================
-# TELEGRAM
+# Telegram
 # =====================
 def send_telegram(text: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
-        logging.warning("Missing BOT_TOKEN or CHAT_ID. Set them in Railway Variables.")
+        logging.warning("Missing BOT_TOKEN or CHAT_ID.")
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
     try:
-        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return True
     except Exception as e:
@@ -90,48 +79,32 @@ def send_telegram(text: str) -> bool:
 
 
 # =====================
-# DATA
+# Data + indicators
 # =====================
 def fetch_ohlc(symbol: str, period: str, interval: str) -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, progress=False)
     if df is None or df.empty:
         raise ValueError(f"No data for {symbol} {period} {interval}")
-
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
-
     df = df.dropna()
     for c in ["Open", "High", "Low", "Close"]:
         if c not in df.columns:
-            raise ValueError(f"Missing column {c} for {symbol}")
+            raise ValueError(f"Missing {c} in {symbol}")
     return df
-
 
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
-
 
 def atr(df: pd.DataFrame, n: int = 14) -> float:
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
     prev_close = close.shift(1)
-
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     val = tr.rolling(n).mean().iloc[-1]
-    if val is None or math.isnan(val):
-        return float(tr.iloc[-1])
-    return float(val)
+    return float(tr.iloc[-1]) if (val is None or math.isnan(val)) else float(val)
 
-
-# =====================
-# TREND (D1 + H4)
-# =====================
 def trend_score(df: pd.DataFrame) -> int:
     c = df["Close"]
     e50 = ema(c, 50).iloc[-1]
@@ -143,18 +116,11 @@ def trend_score(df: pd.DataFrame) -> int:
         return -1
     return 0
 
-
-# =====================
-# SUPPORT/RESISTANCE (Pivot)
-# =====================
-def pivots_sr(df: pd.DataFrame, left: int = 3, right: int = 3, max_levels: int = 6):
+def pivots_sr(df: pd.DataFrame, left: int = 3, right: int = 3, max_levels: int = 10):
     h = df["High"].values
     l = df["Low"].values
     idx = df.index
-
-    piv_high = []
-    piv_low = []
-
+    piv_high, piv_low = [], []
     start = max(left, 0)
     end = len(df) - right
 
@@ -168,16 +134,11 @@ def pivots_sr(df: pd.DataFrame, left: int = 3, right: int = 3, max_levels: int =
     supports = sorted(list({round(p[1], 2) for p in piv_low}))[:max_levels]
     return supports, resistances
 
-
-# =====================
-# FVG (simple ICT 3-candle gap)
-# =====================
-def find_fvg(df: pd.DataFrame, max_zones: int = 2):
+def find_fvg(df: pd.DataFrame, max_zones: int = 1):
     zones = []
     H = df["High"].values
     L = df["Low"].values
     idx = df.index
-
     for i in range(2, len(df)):
         c1 = i - 2
         c3 = i
@@ -185,27 +146,21 @@ def find_fvg(df: pd.DataFrame, max_zones: int = 2):
             zones.append(("BULL_FVG", idx[c3], float(H[c1]), float(L[c3])))
         if L[c1] > H[c3]:
             zones.append(("BEAR_FVG", idx[c3], float(H[c3]), float(L[c1])))
-
     return zones[-max_zones:]
 
-
-# =====================
-# ORDER BLOCK (heuristic)
-# =====================
 def find_order_block(df: pd.DataFrame, direction: str):
     w = df.tail(60).copy()
     w["body"] = (w["Close"] - w["Open"]).abs()
     w["range"] = (w["High"] - w["Low"]).replace(0, np.nan)
     w["body_ratio"] = (w["body"] / w["range"]).fillna(0)
-
     body_med = float(np.median(w["body"].values)) if len(w) else 0.0
 
-    def is_strong_impulse(row) -> bool:
+    def strong(row) -> bool:
         return (row["body"] > 1.5 * body_med) and (row["body_ratio"] > 0.55)
 
     for i in range(len(w) - 2, 2, -1):
         row = w.iloc[i]
-        if not is_strong_impulse(row):
+        if not strong(row):
             continue
 
         impulse_up = row["Close"] > row["Open"]
@@ -215,94 +170,95 @@ def find_order_block(df: pd.DataFrame, direction: str):
             for j in range(i - 1, max(i - 15, 0), -1):
                 r = w.iloc[j]
                 if r["Close"] < r["Open"]:
-                    return (w.index[j], float(r["Low"]), float(r["High"]))
-
+                    return ("BULL_OB", w.index[j], float(r["Low"]), float(r["High"]))
         if direction == "SELL" and impulse_down:
             for j in range(i - 1, max(i - 15, 0), -1):
                 r = w.iloc[j]
                 if r["Close"] > r["Open"]:
-                    return (w.index[j], float(r["Low"]), float(r["High"]))
-
+                    return ("BEAR_OB", w.index[j], float(r["Low"]), float(r["High"]))
     return None
 
-
-# =====================
-# SL / TP selection
-# =====================
-def pick_sl(direction: str, entry: float, ob, supports: list, resistances: list, atr_val: float, sl_buffer_atr: float):
+def pick_tp_from_sr(direction: str, entry: float, supports: list, resistances: list, n: int = 3):
     if direction == "BUY":
-        if ob:
-            sl_base = ob[1]  # OB low
-        else:
-            sl_base = max([s for s in supports if s < entry], default=entry - atr_val)
-        return sl_base - (atr_val * sl_buffer_atr)
-
-    if ob:
-        sl_base = ob[2]  # OB high
+        return sorted([r for r in resistances if r > entry])[:n]
     else:
-        sl_base = min([r for r in resistances if r > entry], default=entry + atr_val)
-    return sl_base + (atr_val * sl_buffer_atr)
-
-
-def pick_tp_levels(direction: str, entry: float, supports: list, resistances: list, n: int = 3):
-    if direction == "BUY":
-        candidates = sorted([r for r in resistances if r > entry])
-        return candidates[:n]
-    else:
-        candidates = sorted([s for s in supports if s < entry], reverse=True)
-        return candidates[:n]
-
-
-# =====================
-# SCORE (Confluence)
-# =====================
-def in_zone(price, low, high):
-    return low <= price <= high
+        return sorted([s for s in supports if s < entry], reverse=True)[:n]
 
 def calc_score(direction, price, supports, resistances, ob, fvgs, td, th, atr_val):
     score = 0
-
-    # (1) Strong trend D1+H4 = 2 points
     if (td + th) in (-2, 2):
         score += 2
 
-    # (2) Near SR = 2 points
     nearest_sup = max([s for s in supports if s < price], default=None)
     nearest_res = min([r for r in resistances if r > price], default=None)
 
     near_sr = False
-    if direction == "BUY" and nearest_sup is not None:
-        if abs(price - nearest_sup) <= (0.8 * atr_val):
-            near_sr = True
-    if direction == "SELL" and nearest_res is not None:
-        if abs(nearest_res - price) <= (0.8 * atr_val):
-            near_sr = True
+    if direction == "BUY" and nearest_sup is not None and abs(price - nearest_sup) <= 0.8 * atr_val:
+        near_sr = True
+    if direction == "SELL" and nearest_res is not None and abs(nearest_res - price) <= 0.8 * atr_val:
+        near_sr = True
     if near_sr:
         score += 2
 
-    # (3) In Order Block = 2 points
+    in_ob = False
     if ob:
-        _, ob_low, ob_high = ob
-        if in_zone(price, ob_low, ob_high):
+        _, _, lo, hi = ob
+        if lo <= price <= hi:
+            in_ob = True
             score += 2
 
-    # (4) In FVG = 2 points
+    in_fvg = False
     if fvgs:
-        for t, _, a1, a2 in fvgs:
-            low, high = min(a1, a2), max(a1, a2)
-            if in_zone(price, low, high):
+        for _, _, a1, a2 in fvgs:
+            lo, hi = min(a1, a2), max(a1, a2)
+            if lo <= price <= hi:
+                in_fvg = True
                 score += 2
                 break
 
-    # (5) Volatility placeholder = 2 points
+    # فلتر تذبذب (نعطي 2 نقاط دائمًا هنا، والفلترة الأساسية تتم عبر SL/Pending distance)
     score += 2
-
-    return score
+    return score, in_ob, in_fvg, nearest_sup, nearest_res
 
 
 # =====================
-# BUILD SIGNAL (per asset)
+# Build message
 # =====================
+def build_market_message(symbol_key, sym, direction, price, sl, tps, score, td, th):
+    risk_usd = round(ACCOUNT_USD * RISK_PCT, 2)
+    def r2(x): return round(float(x), 2)
+    emoji = "🔵" if direction == "BUY" else "🔴"
+    return (
+        f"📌 {symbol_key} ({sym})\n"
+        f"Trend D1/H4: {td:+d} / {th:+d}  => Overall: {(td+th):+d}\n\n"
+        f"{emoji} {direction}: {r2(price)}\n"
+        f"SL: {r2(sl)}\n"
+        f"TP1: {r2(tps[0])}\n"
+        f"TP2: {r2(tps[1])}\n"
+        f"TP3: {r2(tps[2])}\n\n"
+        f"Risk: {int(RISK_PCT*100)}% (~${risk_usd})\n"
+        f"Confidence: {score}/10"
+    )
+
+def build_pending_message(symbol_key, sym, direction, entry, sl, tps, score, td, th, zone_name, zone_low, zone_high):
+    risk_usd = round(ACCOUNT_USD * RISK_PCT, 2)
+    def r2(x): return round(float(x), 2)
+    emoji = "🟦" if direction == "BUY" else "🟥"
+    order_name = "Buy Limit" if direction == "BUY" else "Sell Limit"
+    return (
+        f"📌 {symbol_key} ({sym})\n"
+        f"Trend D1/H4: {td:+d} / {th:+d}  => Overall: {(td+th):+d}\n\n"
+        f"{emoji} {order_name}: {r2(entry)}\n"
+        f"SL: {r2(sl)}\n"
+        f"TP1: {r2(tps[0])}\n"
+        f"TP2: {r2(tps[1])}\n"
+        f"TP3: {r2(tps[2])}\n\n"
+        f"Zone: {zone_name} [{r2(zone_low)} - {r2(zone_high)}]\n"
+        f"Risk: {int(RISK_PCT*100)}% (~${risk_usd})\n"
+        f"Confidence: {score}/10"
+    )
+
+
 def build_signal(symbol_key: str):
     sym = SYMBOLS[symbol_key]
     offset = OFFSETS.get(symbol_key, 0.0)
@@ -312,140 +268,109 @@ def build_signal(symbol_key: str):
     m30 = fetch_ohlc(sym, *TF_MAP["M30"])
     m15 = fetch_ohlc(sym, *TF_MAP["M15"])
 
-    for df in [d1, h4, m30, m15]:
-        df["Open"] = df["Open"] + offset
-        df["High"] = df["High"] + offset
-        df["Low"] = df["Low"] + offset
-        df["Close"] = df["Close"] + offset
+    # Offset
+    for df in (d1, h4, m30, m15):
+        df["Open"] += offset
+        df["High"] += offset
+        df["Low"] += offset
+        df["Close"] += offset
 
     td = trend_score(d1)
     th = trend_score(h4)
     overall = td + th
 
-    # Only strong trend (±2)
+    # ✅ فلتر صارم: فقط ±2
     if overall not in (-2, 2):
         return None
 
     direction = "BUY" if overall > 0 else "SELL"
 
     supports, resistances = pivots_sr(m30, left=3, right=3, max_levels=SR_LEVELS)
-    fvgs = find_fvg(m15, max_zones=2)
+    fvgs = find_fvg(m15, max_zones=1)
     ob = find_order_block(m15, direction=direction)
 
     price = float(m15["Close"].iloc[-1])
     a = atr(m15, 14)
 
-    # Score filter
-    score = calc_score(direction, price, supports, resistances, ob, fvgs, td, th, a)
+    score, in_ob, in_fvg, nearest_sup, nearest_res = calc_score(direction, price, supports, resistances, ob, fvgs, td, th, a)
     if score < MIN_SCORE:
         return None
 
-    # Entry (prefer OB mid, else FVG mid, else market)
+    def r2(x): return round(float(x), 2)
+
+    # =====================
+    # قرار: Market أو Pending فقط
+    # =====================
+
+    # 1) إذا عندنا Zone قوية (OB أو FVG) نرسل Pending لكن بشرط أن تكون قريبة من السعر
+    zone = None
+    if ob:
+        zone = ("OrderBlock", ob[2], ob[3])  # (name, low, high)
+    elif fvgs:
+        t, _, a1, a2 = fvgs[-1]
+        zone = ("FVG", min(a1, a2), max(a1, a2))
+
+    if zone:
+        zone_name, zlow, zhigh = zone
+        entry = (zlow + zhigh) / 2.0
+        distance = abs(entry - price)
+
+        # ✅ فلتر مسافة (يمنع مشكلة النفط)
+        if distance <= (MAX_PENDING_DISTANCE_ATR * a):
+            # SL: خارج الزون مع buffer
+            if direction == "BUY":
+                sl = (zlow - a * SL_BUFFER_ATR)
+            else:
+                sl = (zhigh + a * SL_BUFFER_ATR)
+
+            sl_distance = abs(entry - sl)
+            if sl_distance > MAX_SL_DISTANCE.get(symbol_key, 999999):
+                return None
+
+            tps = pick_tp_from_sr(direction, entry, supports, resistances, n=3)
+            if len(tps) < 3:
+                # fallback بسيط
+                risk = max(0.0001, sl_distance)
+                if direction == "BUY":
+                    tps = [entry + risk, entry + 2*risk, entry + 3*risk]
+                else:
+                    tps = [entry - risk, entry - 2*risk, entry - 3*risk]
+
+            msg = build_pending_message(
+                symbol_key, sym, direction,
+                entry=entry, sl=sl, tps=tps,
+                score=score, td=td, th=th,
+                zone_name=zone_name, zone_low=zlow, zone_high=zhigh
+            )
+            key = (direction, r2(entry), "PENDING")
+            return msg, key
+
+    # 2) غير ذلك: Market signal عند السعر الحالي
     entry = price
-    entry_reason = "Market"
-    buy_limit = None
-    sell_limit = None
-
     if direction == "BUY":
-        if ob:
-            _, ob_low, ob_high = ob
-            entry = (ob_low + ob_high) / 2.0
-            entry_reason = "OrderBlock(mid)"
-            buy_limit = entry
-        else:
-            bull = [z for z in fvgs if z[0] == "BULL_FVG"]
-            if bull:
-                _, _, z1, z2 = bull[-1]
-                entry = (z1 + z2) / 2.0
-                entry_reason = "FVG(mid)"
-                buy_limit = entry
+        base = nearest_sup if nearest_sup is not None else (entry - a)
+        sl = base - a * SL_BUFFER_ATR
     else:
-        if ob:
-            _, ob_low, ob_high = ob
-            entry = (ob_low + ob_high) / 2.0
-            entry_reason = "OrderBlock(mid)"
-            sell_limit = entry
-        else:
-            bear = [z for z in fvgs if z[0] == "BEAR_FVG"]
-            if bear:
-                _, _, z1, z2 = bear[-1]
-                entry = (z1 + z2) / 2.0
-                entry_reason = "FVG(mid)"
-                sell_limit = entry
+        base = nearest_res if nearest_res is not None else (entry + a)
+        sl = base + a * SL_BUFFER_ATR
 
-    # SL (OB first else SR + ATR buffer)
-    sl = pick_sl(direction, entry, ob, supports, resistances, a, SL_BUFFER_ATR)
     sl_distance = abs(entry - sl)
-
-    # SL distance filter for small account
     if sl_distance > MAX_SL_DISTANCE.get(symbol_key, 999999):
         return None
 
-    risk = max(0.0001, sl_distance)
-
-    # TP from SR + fallback RR
-    tps = pick_tp_levels(direction, entry, supports, resistances, n=3)
+    tps = pick_tp_from_sr(direction, entry, supports, resistances, n=3)
     if len(tps) < 3:
+        risk = max(0.0001, sl_distance)
         if direction == "BUY":
-            rr_fallback = [entry + rr * risk for rr in RR_TP]
+            tps = [entry + risk, entry + 2*risk, entry + 3*risk]
         else:
-            rr_fallback = [entry - rr * risk for rr in RR_TP]
-        while len(tps) < 3:
-            tps.append(rr_fallback[len(tps)])
+            tps = [entry - risk, entry - 2*risk, entry - 3*risk]
 
-    nearest_sup = max([s for s in supports if s < price], default=None)
-    nearest_res = min([r for r in resistances if r > price], default=None)
-
-    def r2(x): return round(float(x), 2)
-
-    risk_usd = round(ACCOUNT_USD * RISK_PCT, 2)
-    sig_word = "BUY" if direction == "BUY" else "SELL"
-    emoji = "🔵" if direction == "BUY" else "🔴"
-
-    msg = []
-    msg.append(f"📌 {symbol_key} ({sym})")
-    msg.append(f"Trend D1/H4: {td:+d} / {th:+d}  => Overall: {overall:+d}")
-    msg.append("")
-    msg.append(f"{emoji} {sig_word}: {r2(entry)}")
-    msg.append(f"SL: {r2(sl)}")
-    msg.append(f"TP1: {r2(tps[0])}")
-    msg.append(f"TP2: {r2(tps[1])}")
-    msg.append(f"TP3: {r2(tps[2])}")
-    msg.append(f"Mode: {entry_reason}")
-    msg.append("")
-    msg.append(f"Risk: {int(RISK_PCT*100)}% (~${risk_usd})")
-    msg.append(f"SL Distance: {r2(sl_distance)}")
-    msg.append(f"Confidence: {score}/10")
-    msg.append("")
-
-    if buy_limit or sell_limit:
-        msg.append("⏳ Pending Orders:")
-        if buy_limit:
-            msg.append(f"Buy Limit: {r2(buy_limit)}")
-        if sell_limit:
-            msg.append(f"Sell Limit: {r2(sell_limit)}")
-        msg.append("")
-
-    msg.append("📍 Levels:")
-    if nearest_sup is not None:
-        msg.append(f"Nearest Support: {r2(nearest_sup)}")
-    if nearest_res is not None:
-        msg.append(f"Nearest Resistance: {r2(nearest_res)}")
-    msg.append("")
-
-    if ob:
-        ts, ob_low, ob_high = ob
-        msg.append(f"🧱 Order Block: [{r2(ob_low)} - {r2(ob_high)}]")
-    if fvgs:
-        for t, _, a1, a2 in fvgs:
-            msg.append(f"🕳️ {t}: [{r2(a1)} - {r2(a2)}]")
-
-    return "\n".join(msg), (sig_word, r2(entry))
+    msg = build_market_message(symbol_key, sym, direction, price=entry, sl=sl, tps=tps, score=score, td=td, th=th)
+    key = (direction, r2(entry), "MARKET")
+    return msg, key
 
 
-# =====================
-# MAIN LOOP
-# =====================
 def main():
     last_sent = {}
     last_time = {}
@@ -456,16 +381,18 @@ def main():
             now = time.time()
 
             for key in SYMBOLS.keys():
-                result = build_signal(key)
-                if not result:
+                res = build_signal(key)
+                if not res:
                     continue
 
-                msg, sig_key = result
+                msg, sig_key = res
 
+                # cooldown
                 prev_t = last_time.get(key, 0)
                 if (now - prev_t) < (COOLDOWN_MINUTES * 60):
                     continue
 
+                # dedupe
                 if last_sent.get(key) == sig_key:
                     continue
 
