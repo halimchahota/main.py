@@ -1,4 +1,4 @@
-import os
+import osprint("BOT IS RUNNING")
 import time
 import math
 import hashlib
