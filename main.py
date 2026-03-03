@@ -1,53 +1,49 @@
-import
+import os
 import time
+import json
 import math
-import hashlib
 import logging
-from typing import Dict, Optional, Tuple, List
+from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
+import requests
 
 
 # =========================
-# ENV (Railway Variables)
+# Config from Environment
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()   # ex: "@abdel_tra" OR "-1001234567890"
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-
-ACCOUNT_USD = float(os.getenv("ACCOUNT_USD", "100"))
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
-# Strictness
-BOS_LOOKBACK = int(os.getenv("BOS_LOOKBACK", "10"))
-MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))            # 0.6% ATR%
-SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
-MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.5"))
-
-# Market touch rule:
-TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))        # لمس المنطقة إذا قرب <= 0.35 ATR
-
-# Cache controls
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
-SYMBOLS: Dict[str, str] = {
-    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
-    "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
-    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
-    "US30": os.getenv("US30_SYMBOL", "^DJI"),
-    "OIL": os.getenv("OIL_SYMBOL", "CL=F"),
+# Strategy knobs (ATR-based)
+TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.5"))
+SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))  # skip if ATR% too high (noise/vol spike)
+
+# Symbols
+SYMBOLS = {
+    "XAU": os.getenv("SYMBOL_XAU", "GC=F"),
+    "BTC": os.getenv("SYMBOL_BTC", "BTC-USD"),
+    "US100": os.getenv("SYMBOL_US100", "NQ=F"),
+    "US30": os.getenv("SYMBOL_US30", "^DJI"),
+    "OIL": os.getenv("SYMBOL_OIL", "CL=F"),
 }
 
-PERIOD_D1 = os.getenv("PERIOD_D1", "200d")
-PERIOD_H4 = os.getenv("PERIOD_H4", "90d")
-PERIOD_M30 = os.getenv("PERIOD_M30", "30d")
+STATE_FILE = os.getenv("STATE_FILE", "/tmp/bot_state.json")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
 
 
 # =========================
@@ -55,330 +51,462 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 # =========================
 def tg_send(text: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
-        logging.error("Missing BOT_TOKEN or CHAT_ID in env.")
+        logging.error("BOT_TOKEN or CHAT_ID missing. Set them in Railway Variables.")
         return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True
+    }
     try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=REQUEST_TIMEOUT)
+        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return True
     except Exception as e:
-        logging.error("Telegram error: %s", e)
+        logging.error("Telegram send failed: %s", e)
         return False
 
 
 # =========================
-# Data fetch (reliable H4)
+# State (cooldown)
 # =========================
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_sent": {}}
+
+
+def save_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logging.warning("Failed to save state: %s", e)
+
+
+def now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+
+def cooldown_ok(state: dict, key: str) -> bool:
+    last = state.get("last_sent", {}).get(key)
+    if not last:
+        return True
+    return (now_ts() - int(last)) >= COOLDOWN_MINUTES * 60
+
+
+def mark_sent(state: dict, key: str) -> None:
+    state.setdefault("last_sent", {})[key] = now_ts()
+
+
+# =========================
+# Market data helpers
+# =========================
+def yf_download(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(symbol, period=period, interval=interval, progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # Normalize columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
-    return df
-
-def fetch_ohlc(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    if interval == "4h":
-        df = yf.download(symbol, period=period, interval="1h", progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            raise RuntimeError(f"No data for {symbol} interval=1h period={period}")
-        df = _normalize_columns(df).dropna()
-
-        df_4h = pd.DataFrame()
-        df_4h["Open"] = df["Open"].resample("4H").first()
-        df_4h["High"] = df["High"].resample("4H").max()
-        df_4h["Low"] = df["Low"].resample("4H").min()
-        df_4h["Close"] = df["Close"].resample("4H").last()
-        df_4h = df_4h.dropna()
-        return df_4h
-
-    df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
-    if df is None or df.empty:
-        raise RuntimeError(f"No data for {symbol} interval={interval} period={period}")
-    df = _normalize_columns(df).dropna()
+    df = df.rename(columns=str.title)
+    for col in ["Open", "High", "Low", "Close"]:
+        if col not in df.columns:
+            return pd.DataFrame()
+    df = df.dropna()
     return df
 
 
-# =========================
-# Indicators
-# =========================
-def ema(series: pd.Series, n: int) -> pd.Series:
-    return series.ewm(span=n, adjust=False).mean()
+def resample_ohlc(df_1h: pd.DataFrame, rule: str) -> pd.DataFrame:
+    o = df_1h["Open"].resample(rule).first()
+    h = df_1h["High"].resample(rule).max()
+    l = df_1h["Low"].resample(rule).min()
+    c = df_1h["Close"].resample(rule).last()
+    out = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}).dropna()
+    return out
 
-def atr(df: pd.DataFrame, n: int = 14) -> float:
+
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
     prev_close = close.shift(1)
-
     tr = pd.concat([
         (high - low),
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
 
-    val = tr.rolling(n).mean().iloc[-1]
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return float(tr.iloc[-1])
-    return float(val)
 
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+# =========================
+# S/R pivots
+# =========================
+def pivot_levels(df: pd.DataFrame, window: int = 3, top_n: int = 3):
+    # simple pivots
+    highs = df["High"]
+    lows = df["Low"]
+
+    ph = (highs.shift(window) < highs) & (highs.shift(-window) < highs)
+    pl = (lows.shift(window) > lows) & (lows.shift(-window) > lows)
+
+    piv_h = df.loc[ph, "High"].tail(30).tolist()
+    piv_l = df.loc[pl, "Low"].tail(30).tolist()
+
+    # pick most recent unique-ish
+    def uniq_last(vals):
+        out = []
+        for v in reversed(vals):
+            if all(abs(v - x) > (abs(v) * 0.0005 + 1e-9) for x in out):
+                out.append(v)
+            if len(out) >= top_n:
+                break
+        return list(reversed(out))
+
+    return uniq_last(piv_l), uniq_last(piv_h)
+
+
+# =========================
+# FVG (ICT-style approximation)
+# =========================
+def find_last_fvgs(df: pd.DataFrame, lookback: int = 120):
+    # bullish: high(i-1) < low(i+1)
+    # bearish: low(i-1) > high(i+1)
+    d = df.tail(lookback).copy()
+    if len(d) < 5:
+        return [], []
+
+    bull = []
+    bear = []
+    h = d["High"].values
+    l = d["Low"].values
+    idx = d.index.to_list()
+
+    for i in range(1, len(d) - 1):
+        if h[i - 1] < l[i + 1]:
+            bull.append((idx[i], float(h[i - 1]), float(l[i + 1])))
+        if l[i - 1] > h[i + 1]:
+            bear.append((idx[i], float(h[i + 1]), float(l[i - 1])))
+
+    return bull[-2:], bear[-2:]
+
+
+# =========================
+# OrderBlock (approximation)
+# =========================
+def find_order_block(df: pd.DataFrame, direction: str, atr_val: float, lookback: int = 60):
+    """
+    Approx:
+    - For BUY: find last bearish candle before a strong up impulse
+    - For SELL: find last bullish candle before a strong down impulse
+    """
+    d = df.tail(lookback).copy()
+    if len(d) < 20 or not atr_val or math.isnan(atr_val):
+        return None
+
+    d["Body"] = (d["Close"] - d["Open"]).abs()
+    d["Ret"] = d["Close"].pct_change()
+
+    # define impulse as move > 1.2*ATR in next few candles
+    impulse_mult = 1.2
+
+    candles = list(d.itertuples())
+    for j in range(len(candles) - 6, 5, -1):
+        c = candles[j]
+        # next move magnitude
+        nxt = d.iloc[j+1:j+6]
+        if nxt.empty:
+            continue
+        move_up = (nxt["High"].max() - c.Close)
+        move_dn = (c.Close - nxt["Low"].min())
+
+        if direction == "BUY":
+            # bearish candle then strong up
+            if c.Close < c.Open and move_up >= impulse_mult * atr_val:
+                low_ = float(min(c.Open, c.Close, c.Low))
+                high_ = float(max(c.Open, c.Close, c.High))
+                return (low_, high_)
+        else:
+            # bullish candle then strong down
+            if c.Close > c.Open and move_dn >= impulse_mult * atr_val:
+                low_ = float(min(c.Open, c.Close, c.Low))
+                high_ = float(max(c.Open, c.Close, c.High))
+                return (low_, high_)
+    return None
+
+
+# =========================
+# Trend (D1 + H4)
+# =========================
 def trend_score(df: pd.DataFrame) -> int:
-    if df is None or df.empty or len(df) < 80:
+    if df.empty or len(df) < 220:
         return 0
     c = df["Close"]
-    e50 = ema(c, 50)
-    e200 = ema(c, 200) if len(df) >= 200 else ema(c, 100)
+    e50 = ema(c, 50).iloc[-1]
+    e200 = ema(c, 200).iloc[-1]
+    last = c.iloc[-1]
 
-    slope = float(e50.iloc[-1] - e50.iloc[-10]) if len(e50) >= 11 else 0.0
-    if (c.iloc[-1] > e50.iloc[-1] > e200.iloc[-1]) and slope > 0:
+    if last > e200 and e50 > e200:
         return +1
-    if (c.iloc[-1] < e50.iloc[-1] < e200.iloc[-1]) and slope < 0:
+    if last < e200 and e50 < e200:
         return -1
     return 0
 
-def atr_ok_m30(m30: pd.DataFrame) -> bool:
-    if m30 is None or m30.empty or len(m30) < 30:
-        return True
-    a = atr(m30, 14)
-    price = float(m30["Close"].iloc[-1])
-    if price <= 0:
-        return True
-    return (a / price) <= MAX_ATR_PCT
-
-def candle_confirm_m30(m30: pd.DataFrame, direction: str) -> bool:
-    o = float(m30["Open"].iloc[-1])
-    c = float(m30["Close"].iloc[-1])
-    return (c > o) if direction == "BUY" else (c < o)
-
-def bos_m30(m30: pd.DataFrame, direction: str) -> bool:
-    if m30 is None or m30.empty or len(m30) < BOS_LOOKBACK + 2:
-        return False
-    d = m30.tail(BOS_LOOKBACK + 2)
-    last_close = float(d["Close"].iloc[-1])
-    prev_high = float(d["High"].iloc[:-1].max())
-    prev_low = float(d["Low"].iloc[:-1].min())
-    return (last_close > prev_high) if direction == "BUY" else (last_close < prev_low)
-
 
 # =========================
-# Zones: Order Block + FVG (M30)
+# Signal on M30 with zones
 # =========================
-def find_order_block_m30(m30: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
-    if m30 is None or m30.empty or len(m30) < 50:
+def build_trade(symbol_name: str, symbol: str):
+    # D1
+    d1 = yf_download(symbol, period="180d", interval="1d")
+    # H4 (from 1h)
+    h1 = yf_download(symbol, period="60d", interval="60m")
+    if h1.empty:
+        return None
+    h4 = resample_ohlc(h1, "4H")
+
+    # M30 (entry timeframe)
+    m30 = yf_download(symbol, period="14d", interval="30m")
+    if d1.empty or h4.empty or m30.empty:
         return None
 
-    w = m30.tail(140).copy()
-    bodies = (w["Close"] - w["Open"]).abs()
-    thr = float(bodies.quantile(0.75))
+    d1_score = trend_score(d1)
+    h4_score = trend_score(h4)
+    overall = d1_score + h4_score
 
-    for i in range(len(w) - 3, 10, -1):
-        o = float(w["Open"].iloc[i]); c = float(w["Close"].iloc[i])
-        lo = float(w["Low"].iloc[i]); hi = float(w["High"].iloc[i])
+    last_price = float(m30["Close"].iloc[-1])
 
-        next_body = abs(float(w["Close"].iloc[i+1]) - float(w["Open"].iloc[i+1]))
-        if next_body < thr:
-            continue
+    # ATR on M30
+    m30_atr = atr(m30, 14).iloc[-1]
+    if not m30_atr or math.isnan(m30_atr):
+        return None
 
-        if direction == "BUY":
-            if c < o and float(w["Close"].iloc[i+1]) > float(w["Open"].iloc[i+1]):
-                return (min(lo, hi), max(lo, hi))
+    atr_pct = m30_atr / last_price if last_price else 0
+    if atr_pct > MAX_ATR_PCT:
+        # Vol spike - skip
+        return {
+            "name": symbol_name, "symbol": symbol,
+            "skip": True,
+            "reason": f"ATR% too high ({atr_pct:.4f} > {MAX_ATR_PCT})",
+            "price": last_price
+        }
 
-        if direction == "SELL":
-            if c > o and float(w["Close"].iloc[i+1]) < float(w["Open"].iloc[i+1]):
-                return (min(lo, hi), max(lo, hi))
-
-    return None
-
-def find_fvg_m30(m30: pd.DataFrame, direction: str, max_items: int = 2) -> List[Tuple[float, float]]:
-    if m30 is None or m30.empty or len(m30) < 10:
-        return []
-
-    d = m30.tail(400)
-    zones: List[Tuple[float, float]] = []
-    for i in range(2, len(d)):
-        h2 = float(d["High"].iloc[i - 2])
-        l2 = float(d["Low"].iloc[i - 2])
-        hi = float(d["High"].iloc[i])
-        lo = float(d["Low"].iloc[i])
-
-        if direction == "BUY" and lo > h2:
-            zones.append((min(h2, lo), max(h2, lo)))
-
-        if direction == "SELL" and hi < l2:
-            zones.append((min(hi, l2), max(hi, l2)))
-
-    return zones[-max_items:]
-
-def zone_mid(zone: Tuple[float, float]) -> float:
-    return (zone[0] + zone[1]) / 2.0
-
-def price_touches_zone(price: float, zone: Tuple[float, float], a30: float) -> bool:
-    # داخل الزون أو قريب منها بقدر ATR*TOUCH_ATR_MULT
-    low, high = zone
-    if low <= price <= high:
-        return True
-    return abs(price - zone_mid(zone)) <= (TOUCH_ATR_MULT * a30)
-
-
-# =========================
-# TP levels (big targets)
-# =========================
-def calc_tps(direction: str, entry: float, sl: float) -> Tuple[float, float, float]:
-    # Bigger targets: 3R / 5R / 8R
-    R = abs(entry - sl)
-    if R <= 0:
-        R = max(entry * 0.001, 0.5)
-
-    if direction == "BUY":
-        return entry + 3*R, entry + 5*R, entry + 8*R
+    # Bias from D1+H4
+    if overall >= 1:
+        bias = "BUY"
+    elif overall <= -1:
+        bias = "SELL"
     else:
-        return entry - 3*R, entry - 5*R, entry - 8*R
+        bias = "NEUTRAL"
 
+    # Zones: supports/resistances + orderblock + fvgs
+    supports, resistances = pivot_levels(m30, window=3, top_n=3)
+    bull_fvgs, bear_fvgs = find_last_fvgs(m30, lookback=140)
 
-# =========================
-# Signal engine (M30 pro + Market/Pending)
-# =========================
-def build_signal(name: str, symbol: str) -> Optional[str]:
-    d1 = fetch_ohlc(symbol, "1d", PERIOD_D1)
-    h4 = fetch_ohlc(symbol, "4h", PERIOD_H4)
-    m30 = fetch_ohlc(symbol, "30m", PERIOD_M30)
+    ob = None
+    if bias == "BUY":
+        ob = find_order_block(m30, "BUY", float(m30_atr))
+    elif bias == "SELL":
+        ob = find_order_block(m30, "SELL", float(m30_atr))
 
-    td = trend_score(d1)
-    th = trend_score(h4)
-    overall = td + th
-
-    # Strict: only +2 / -2
-    if overall not in (-2, 2):
-        return None
-
-    direction = "BUY" if overall == 2 else "SELL"
-
-    # M30 pro filters
-    if not atr_ok_m30(m30):
-        return None
-    if not candle_confirm_m30(m30, direction):
-        return None
-    if not bos_m30(m30, direction):
-        return None
-
-    price = float(m30["Close"].iloc[-1])
-    a30 = atr(m30, 14)
-
-    ob = find_order_block_m30(m30, direction)
-    fvgs = find_fvg_m30(m30, direction, max_items=2)
-
-    best_zone = None
-    best_name = None
+    zones = []
+    # Add OB
     if ob:
-        best_zone = ob
-        best_name = "OrderBlock"
-    elif fvgs:
-        best_zone = fvgs[-1]
-        best_name = "FVG"
+        zlow, zhigh = ob
+        zones.append(("OrderBlock", zlow, zhigh))
+
+    # Add last FVGs
+    for _, lo, hi in bull_fvgs:
+        zones.append(("BULL_FVG", lo, hi))
+    for _, lo, hi in bear_fvgs:
+        zones.append(("BEAR_FVG", lo, hi))
+
+    # Add SR
+    for s in supports:
+        zones.append(("Support", s - 0.10 * m30_atr, s + 0.10 * m30_atr))
+    for r in resistances:
+        zones.append(("Resistance", r - 0.10 * m30_atr, r + 0.10 * m30_atr))
+
+    # Choose best pending entry zone
+    max_dist = MAX_PENDING_DISTANCE_ATR * m30_atr
+
+    def zone_mid(z):
+        return (z[1] + z[2]) / 2.0
+
+    chosen = None
+    if bias == "BUY":
+        # pick closest zone below price within max_dist
+        candidates = [z for z in zones if zone_mid(z) <= last_price and (last_price - zone_mid(z)) <= max_dist]
+        if candidates:
+            chosen = sorted(candidates, key=lambda z: (last_price - zone_mid(z)))[0]
+    elif bias == "SELL":
+        # pick closest zone above price within max_dist
+        candidates = [z for z in zones if zone_mid(z) >= last_price and (zone_mid(z) - last_price) <= max_dist]
+        if candidates:
+            chosen = sorted(candidates, key=lambda z: (zone_mid(z) - last_price))[0]
+
+    # If neutral or no zone, fallback: no trade
+    if bias == "NEUTRAL" or not chosen:
+        return {
+            "name": symbol_name, "symbol": symbol,
+            "bias": bias,
+            "trend": (d1_score, h4_score, overall),
+            "price": last_price,
+            "atr": float(m30_atr),
+            "supports": supports,
+            "resistances": resistances,
+            "ob": ob,
+            "bull_fvgs": bull_fvgs,
+            "bear_fvgs": bear_fvgs,
+            "trade": None
+        }
+
+    zname, zlow, zhigh = chosen
+    entry = (zlow + zhigh) / 2.0
+
+    # Touch filter (optional): if price already close to zone, still ok
+    # (This is just for reporting; we still send pending by default)
+    touch_ok = abs(last_price - entry) <= (TOUCH_ATR_MULT * m30_atr)
+
+    # SL/TP
+    if bias == "BUY":
+        sl = zlow - SL_BUFFER_ATR * m30_atr
+        r = entry - sl
+        tp1 = entry + 1.0 * r
+        tp2 = entry + 2.0 * r
+        tp3 = entry + 3.0 * r
+        pending_type = "Buy Limit"
     else:
-        return None
+        sl = zhigh + SL_BUFFER_ATR * m30_atr
+        r = sl - entry
+        tp1 = entry - 1.0 * r
+        tp2 = entry - 2.0 * r
+        tp3 = entry - 3.0 * r
+        pending_type = "Sell Limit"
 
-    risk_usd = round(ACCOUNT_USD * (RISK_PCT / 100.0), 2)
-    emoji = "🔵" if direction == "BUY" else "🔴"
+    # Risk info
+    risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
 
-    # ✅ Market إذا لمس المنطقة
-    if price_touches_zone(price, best_zone, a30):
-        entry = price  # Market at current M30 close
-        if direction == "BUY":
-            sl = best_zone[0] - (a30 * SL_BUFFER_ATR)
-        else:
-            sl = best_zone[1] + (a30 * SL_BUFFER_ATR)
+    return {
+        "name": symbol_name, "symbol": symbol,
+        "bias": bias,
+        "trend": (d1_score, h4_score, overall),
+        "price": last_price,
+        "atr": float(m30_atr),
+        "atr_pct": float(m30_atr / last_price),
+        "supports": supports,
+        "resistances": resistances,
+        "ob": ob,
+        "bull_fvgs": bull_fvgs,
+        "bear_fvgs": bear_fvgs,
+        "trade": {
+            "pending_type": pending_type,
+            "zone_name": zname,
+            "zone": (float(zlow), float(zhigh)),
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp1": float(tp1),
+            "tp2": float(tp2),
+            "tp3": float(tp3),
+            "touch_ok": bool(touch_ok),
+            "risk_pct": float(RISK_PCT),
+            "risk_usd": float(risk_usd),
+        }
+    }
 
-        tp1, tp2, tp3 = calc_tps(direction, entry, sl)
 
-        msg = (
-            f"📌 {name} ({symbol})\n"
-            f"Trend D1/H4: {td:+d} / {th:+d} => Overall: {overall:+d}\n\n"
-            f"{emoji} {direction} (MARKET): {entry:.2f}\n"
-            f"SL: {sl:.2f}\n"
-            f"TP1: {tp1:.2f}\n"
-            f"TP2: {tp2:.2f}\n"
-            f"TP3: {tp3:.2f}\n\n"
-            f"Zone: {best_name} [{best_zone[0]:.2f} - {best_zone[1]:.2f}]\n"
-            f"Risk: {int(RISK_PCT)}% (~${risk_usd})\n"
-            f"TF: M30 Pro (Candle+BOS)"
+def fmt_trade(t: dict) -> str:
+    name = t["name"]
+    sym = t["symbol"]
+    price = t.get("price")
+    d1, h4, overall = t.get("trend", (0, 0, 0))
+    bias = t.get("bias", "NA")
+
+    if t.get("skip"):
+        return (
+            f"📌 {name} ({sym})\n"
+            f"Price: {price}\n"
+            f"⛔ Skip: {t.get('reason')}\n"
         )
-        return msg
 
-    # ✅ وإلا Pending عند منتصف المنطقة (إذا ليست بعيدة جدًا)
-    entry = zone_mid(best_zone)
-    if abs(entry - price) > (MAX_PENDING_DISTANCE_ATR * a30):
-        return None
+    trade = t.get("trade")
+    lines = []
+    lines.append(f"📌 {name} ({sym})")
+    lines.append(f"Trend D1/H4: {d1:+d} / {h4:+d}  => Overall: {overall:+d}")
+    lines.append(f"TF Entry: M30")
+    lines.append(f"Price: {price:.5f}" if price and price < 1000 else f"Price: {price:.2f}")
 
-    if direction == "BUY":
-        sl = best_zone[0] - (a30 * SL_BUFFER_ATR)
-        order_name = "Buy Limit"
-    else:
-        sl = best_zone[1] + (a30 * SL_BUFFER_ATR)
-        order_name = "Sell Limit"
+    if not trade:
+        lines.append("Signal: ⚪ NO TRADE (no clear bias/zone)")
+        return "\n".join(lines)
 
-    tp1, tp2, tp3 = calc_tps(direction, entry, sl)
+    entry = trade["entry"]
+    sl = trade["sl"]
+    tp1, tp2, tp3 = trade["tp1"], trade["tp2"], trade["tp3"]
+    zlow, zhigh = trade["zone"]
+    ptype = trade["pending_type"]
+    zname = trade["zone_name"]
 
-    msg = (
-        f"📌 {name} ({symbol})\n"
-        f"Trend D1/H4: {td:+d} / {th:+d} => Overall: {overall:+d}\n\n"
-        f"{'🟢' if direction=='BUY' else '🔴'} {order_name}: {entry:.2f}\n"
-        f"SL: {sl:.2f}\n"
-        f"TP1: {tp1:.2f}\n"
-        f"TP2: {tp2:.2f}\n"
-        f"TP3: {tp3:.2f}\n\n"
-        f"Zone: {best_name} [{best_zone[0]:.2f} - {best_zone[1]:.2f}]\n"
-        f"Risk: {int(RISK_PCT)}% (~${risk_usd})\n"
-        f"TF: M30 Pro (Candle+BOS)"
-    )
-    return msg
+    def f(x):
+        if abs(x) < 1000:
+            return f"{x:.5f}"
+        return f"{x:.2f}"
 
+    lines.append(f"Signal: {'🔵 BUY' if bias=='BUY' else '🔴 SELL'} (Pending)")
+    lines.append(f"🟢 {ptype}: {f(entry)}")
+    lines.append(f"SL: {f(sl)}")
+    lines.append(f"TP1: {f(tp1)}")
+    lines.append(f"TP2: {f(tp2)}")
+    lines.append(f"TP3: {f(tp3)}")
+    lines.append(f"Zone: {zname} [{f(zlow)} - {f(zhigh)}]")
+    lines.append(f"Risk: {trade['risk_pct']:.1f}% (~${trade['risk_usd']:.2f})")
+    return "\n".join(lines)
 
-# =========================
-# Cache / Anti-spam
-# =========================
-def msg_hash(msg: str) -> str:
-    return hashlib.sha256(msg.encode("utf-8")).hexdigest()
 
 def main():
-    if BOT_TOKEN and CHAT_ID:
-        tg_send("✅ Bot started (M30 Pro: Market on Touch + Pending OB/FVG)")
-
-    last_hash: Dict[str, str] = {}
-    last_time: Dict[str, float] = {}
+    # Quick startup ping (optional)
+    logging.info("Bot starting...")
+    state = load_state()
 
     while True:
         try:
-            now = time.time()
-
+            msgs = []
             for name, sym in SYMBOLS.items():
-                prev = last_time.get(name, 0.0)
-                if (now - prev) < (COOLDOWN_MINUTES * 60):
+                result = build_trade(name, sym)
+                if not result:
                     continue
 
-                try:
-                    msg = build_signal(name, sym)
-                except Exception as e:
-                    logging.error("Build error %s (%s): %s", name, sym, e)
-                    continue
+                # cooldown key per symbol+direction+entry
+                key = f"{name}:{result.get('bias')}"
 
-                if not msg:
-                    continue
+                # only send when we actually have a trade
+                if result.get("trade") and cooldown_ok(state, key):
+                    msgs.append(fmt_trade(result))
+                    mark_sent(state, key)
 
-                h = msg_hash(msg)
-                if last_hash.get(name) == h:
-                    continue
-
-                if tg_send(msg):
-                    last_hash[name] = h
-                    last_time[name] = now
-                    logging.info("Sent %s", name)
-                    time.sleep(1)
-
-            time.sleep(CHECK_INTERVAL_SEC)
+            if msgs:
+                final = "بوت الشبح (M30)\n\n" + "\n\n".join(msgs)
+                ok = tg_send(final)
+                if ok:
+                    save_state(state)
+                    logging.info("Signals sent: %d", len(msgs))
+                else:
+                    logging.warning("Failed to send signals.")
+            else:
+                logging.info("No new signals (cooldown/no-trade).")
 
         except Exception as e:
-            logging.error("Main loop error: %s", e)
-            time.sleep(10)
+            logging.exception("Main loop error: %s", e)
+
+        time.sleep(CHECK_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
