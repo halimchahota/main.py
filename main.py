@@ -1,46 +1,51 @@
 import os
 import time
 import math
+import hashlib
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, Optional, Tuple, List
 
+import numpy as np
+import pandas as pd
 import requests
 import yfinance as yf
-import pandas as pd
 
 
 # =========================
-# Config (from Environment)
+# ENV (Railway Variables)
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))  # $
-RISK_PCT = float(os.getenv("RISK_PCT", "3"))                  # %
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))       # seconds
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
-# Send WAIT? (0 = لا, 1 = نعم)
-SEND_WAIT = os.getenv("SEND_WAIT", "0").strip() == "1"
+ACCOUNT_USD = float(os.getenv("ACCOUNT_USD", "100"))
+RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
-# Limit error notifications to avoid spam
-ERROR_NOTIFY_COOLDOWN_SEC = int(os.getenv("ERROR_NOTIFY_COOLDOWN_SEC", "900"))  # 15m
+# Strictness
+BOS_LOOKBACK = int(os.getenv("BOS_LOOKBACK", "10"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))            # 0.6% ATR%
+SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.5"))
 
-# Symbols (Yahoo Finance)
+# Market touch rule:
+TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))        # لمس المنطقة إذا قرب <= 0.35 ATR
+
+# Cache controls
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
+
 SYMBOLS: Dict[str, str] = {
-    "XAU": "GC=F",      # Gold futures
-    "BTC": "BTC-USD",
-    "US100": "NQ=F",    # Nasdaq futures
-    "US30": "^DJI",     # Dow Jones index
-    "OIL": "CL=F",      # Crude oil futures
+    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
+    "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
+    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
+    "US30": os.getenv("US30_SYMBOL", "^DJI"),
+    "OIL": os.getenv("OIL_SYMBOL", "CL=F"),
 }
 
-# Timeframes used
-TF_D1 = ("1d", "90d")
-TF_H4 = ("4h", "60d")
-TF_M30 = ("30m", "14d")
-TF_M15 = ("15m", "7d")
+PERIOD_D1 = os.getenv("PERIOD_D1", "200d")
+PERIOD_H4 = os.getenv("PERIOD_H4", "90d")
+PERIOD_M30 = os.getenv("PERIOD_M30", "30d")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -48,359 +53,333 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 # =========================
 # Telegram
 # =========================
-def send_telegram_message(text: str) -> bool:
+def tg_send(text: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
-        logging.error("Missing BOT_TOKEN or CHAT_ID. Set them in Railway Variables.")
+        logging.error("Missing BOT_TOKEN or CHAT_ID in env.")
         return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
     try:
-        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return True
-    except requests.RequestException as e:
-        logging.error("Telegram send failed: %s", e)
+    except Exception as e:
+        logging.error("Telegram error: %s", e)
         return False
 
 
 # =========================
-# Market Data
+# Data fetch (reliable H4)
 # =========================
-def fetch_ohlc(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval=interval, progress=False)
-    if df is None or df.empty:
-        raise RuntimeError(f"No data for {symbol} interval={interval} period={period}")
-
-    # Normalize columns (some come as multi-index)
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
+    return df
 
-    df = df.dropna()
-    # Ensure required columns exist
-    needed = {"Open", "High", "Low", "Close"}
-    if not needed.issubset(set(df.columns)):
-        raise RuntimeError(f"Missing OHLC columns for {symbol}: {df.columns.tolist()}")
+def fetch_ohlc(symbol: str, interval: str, period: str) -> pd.DataFrame:
+    if interval == "4h":
+        df = yf.download(symbol, period=period, interval="1h", progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            raise RuntimeError(f"No data for {symbol} interval=1h period={period}")
+        df = _normalize_columns(df).dropna()
 
+        df_4h = pd.DataFrame()
+        df_4h["Open"] = df["Open"].resample("4H").first()
+        df_4h["High"] = df["High"].resample("4H").max()
+        df_4h["Low"] = df["Low"].resample("4H").min()
+        df_4h["Close"] = df["Close"].resample("4H").last()
+        df_4h = df_4h.dropna()
+        return df_4h
+
+    df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        raise RuntimeError(f"No data for {symbol} interval={interval} period={period}")
+    df = _normalize_columns(df).dropna()
     return df
 
 
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+# =========================
+# Indicators
+# =========================
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
 
+def atr(df: pd.DataFrame, n: int = 14) -> float:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    val = tr.rolling(n).mean().iloc[-1]
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return float(tr.iloc[-1])
+    return float(val)
 
 def trend_score(df: pd.DataFrame) -> int:
-    close = df["Close"]
-    e20 = ema(close, 20)
-    e50 = ema(close, 50)
-
-    if len(e20) < 30:
+    if df is None or df.empty or len(df) < 80:
         return 0
+    c = df["Close"]
+    e50 = ema(c, 50)
+    e200 = ema(c, 200) if len(df) >= 200 else ema(c, 100)
 
-    slope = (e20.iloc[-1] - e20.iloc[-10])  # 10 bars slope
-    bullish = (e20.iloc[-1] > e50.iloc[-1]) and (slope > 0)
-    bearish = (e20.iloc[-1] < e50.iloc[-1]) and (slope < 0)
-
-    if bullish:
+    slope = float(e50.iloc[-1] - e50.iloc[-10]) if len(e50) >= 11 else 0.0
+    if (c.iloc[-1] > e50.iloc[-1] > e200.iloc[-1]) and slope > 0:
         return +1
-    if bearish:
+    if (c.iloc[-1] < e50.iloc[-1] < e200.iloc[-1]) and slope < 0:
         return -1
     return 0
 
+def atr_ok_m30(m30: pd.DataFrame) -> bool:
+    if m30 is None or m30.empty or len(m30) < 30:
+        return True
+    a = atr(m30, 14)
+    price = float(m30["Close"].iloc[-1])
+    if price <= 0:
+        return True
+    return (a / price) <= MAX_ATR_PCT
 
-# =========================
-# Levels: Support/Resistance
-# =========================
-def swing_levels(df: pd.DataFrame, lookback: int = 120) -> Tuple[List[float], List[float]]:
-    d = df.tail(lookback).copy()
-    highs = d["High"].values
-    lows = d["Low"].values
+def candle_confirm_m30(m30: pd.DataFrame, direction: str) -> bool:
+    o = float(m30["Open"].iloc[-1])
+    c = float(m30["Close"].iloc[-1])
+    return (c > o) if direction == "BUY" else (c < o)
 
-    supports: List[float] = []
-    resistances: List[float] = []
-
-    for i in range(2, len(d) - 2):
-        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
-            supports.append(float(lows[i]))
-        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
-            resistances.append(float(highs[i]))
-
-    def dedup(levels: List[float], tol: float) -> List[float]:
-        out: List[float] = []
-        for x in sorted(levels):
-            if not out or abs(x - out[-1]) > tol:
-                out.append(x)
-        return out
-
-    last_price = float(d["Close"].iloc[-1])
-    tol = max(0.001 * last_price, 0.5)
-
-    supports = dedup(supports, tol)
-    resistances = dedup(resistances, tol)
-
-    supports_sorted = sorted(supports, key=lambda x: abs(last_price - x))
-    resist_sorted = sorted(resistances, key=lambda x: abs(last_price - x))
-
-    return supports_sorted[:3], resist_sorted[:3]
+def bos_m30(m30: pd.DataFrame, direction: str) -> bool:
+    if m30 is None or m30.empty or len(m30) < BOS_LOOKBACK + 2:
+        return False
+    d = m30.tail(BOS_LOOKBACK + 2)
+    last_close = float(d["Close"].iloc[-1])
+    prev_high = float(d["High"].iloc[:-1].max())
+    prev_low = float(d["Low"].iloc[:-1].min())
+    return (last_close > prev_high) if direction == "BUY" else (last_close < prev_low)
 
 
 # =========================
-# Order Block (simple)
+# Zones: Order Block + FVG (M30)
 # =========================
-@dataclass
-class OrderBlock:
-    low: float
-    high: float
-
-    @property
-    def mid(self) -> float:
-        return (self.low + self.high) / 2.0
-
-
-def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[OrderBlock]:
-    d = df.tail(120).copy()
-    if len(d) < 30:
+def find_order_block_m30(m30: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
+    if m30 is None or m30.empty or len(m30) < 50:
         return None
 
-    bodies = (d["Close"] - d["Open"]).abs()
-    body_thr = bodies.quantile(0.75)
+    w = m30.tail(140).copy()
+    bodies = (w["Close"] - w["Open"]).abs()
+    thr = float(bodies.quantile(0.75))
 
-    for i in range(len(d) - 5, 10, -1):
-        o, c = float(d["Open"].iloc[i]), float(d["Close"].iloc[i])
-        h, l = float(d["High"].iloc[i]), float(d["Low"].iloc[i])
+    for i in range(len(w) - 3, 10, -1):
+        o = float(w["Open"].iloc[i]); c = float(w["Close"].iloc[i])
+        lo = float(w["Low"].iloc[i]); hi = float(w["High"].iloc[i])
 
-        next_body = abs(float(d["Close"].iloc[i+1]) - float(d["Open"].iloc[i+1]))
-        if next_body < body_thr:
+        next_body = abs(float(w["Close"].iloc[i+1]) - float(w["Open"].iloc[i+1]))
+        if next_body < thr:
             continue
 
         if direction == "BUY":
-            if c < o and float(d["Close"].iloc[i+1]) > float(d["Open"].iloc[i+1]):
-                return OrderBlock(low=l, high=h)
+            if c < o and float(w["Close"].iloc[i+1]) > float(w["Open"].iloc[i+1]):
+                return (min(lo, hi), max(lo, hi))
 
         if direction == "SELL":
-            if c > o and float(d["Close"].iloc[i+1]) < float(d["Open"].iloc[i+1]):
-                return OrderBlock(low=l, high=h)
+            if c > o and float(w["Close"].iloc[i+1]) < float(w["Open"].iloc[i+1]):
+                return (min(lo, hi), max(lo, hi))
 
     return None
 
+def find_fvg_m30(m30: pd.DataFrame, direction: str, max_items: int = 2) -> List[Tuple[float, float]]:
+    if m30 is None or m30.empty or len(m30) < 10:
+        return []
 
-# =========================
-# FVG (simple)
-# =========================
-def find_fvgs(df: pd.DataFrame, max_items: int = 2) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
-    d = df.tail(200).copy()
-    bull: List[Tuple[float, float]] = []
-    bear: List[Tuple[float, float]] = []
-
+    d = m30.tail(400)
+    zones: List[Tuple[float, float]] = []
     for i in range(2, len(d)):
-        h2 = float(d["High"].iloc[i-2])
-        l2 = float(d["Low"].iloc[i-2])
+        h2 = float(d["High"].iloc[i - 2])
+        l2 = float(d["Low"].iloc[i - 2])
         hi = float(d["High"].iloc[i])
-        li = float(d["Low"].iloc[i])
+        lo = float(d["Low"].iloc[i])
 
-        if li > h2:
-            bull.append((h2, li))
-        if hi < l2:
-            bear.append((hi, l2))
+        if direction == "BUY" and lo > h2:
+            zones.append((min(h2, lo), max(h2, lo)))
 
-    return bull[-max_items:], bear[-max_items:]
+        if direction == "SELL" and hi < l2:
+            zones.append((min(hi, l2), max(hi, l2)))
+
+    return zones[-max_items:]
+
+def zone_mid(zone: Tuple[float, float]) -> float:
+    return (zone[0] + zone[1]) / 2.0
+
+def price_touches_zone(price: float, zone: Tuple[float, float], a30: float) -> bool:
+    # داخل الزون أو قريب منها بقدر ATR*TOUCH_ATR_MULT
+    low, high = zone
+    if low <= price <= high:
+        return True
+    return abs(price - zone_mid(zone)) <= (TOUCH_ATR_MULT * a30)
 
 
 # =========================
-# Risk + Targets
+# TP levels (big targets)
 # =========================
-def calc_levels(direction: str, entry: float, sl: float) -> Tuple[float, float, float]:
-    r = abs(entry - sl)
-    if r <= 0:
-        r = max(entry * 0.001, 0.5)
+def calc_tps(direction: str, entry: float, sl: float) -> Tuple[float, float, float]:
+    # Bigger targets: 3R / 5R / 8R
+    R = abs(entry - sl)
+    if R <= 0:
+        R = max(entry * 0.001, 0.5)
 
     if direction == "BUY":
-        return entry + 1*r, entry + 2*r, entry + 3*r
+        return entry + 3*R, entry + 5*R, entry + 8*R
     else:
-        return entry - 1*r, entry - 2*r, entry - 3*r
+        return entry - 3*R, entry - 5*R, entry - 8*R
 
 
 # =========================
-# Signal Engine
+# Signal engine (M30 pro + Market/Pending)
 # =========================
-def decide_signal(d1: pd.DataFrame, h4: pd.DataFrame, m30: pd.DataFrame, m15: pd.DataFrame) -> Tuple[str, int]:
-    t_d1 = trend_score(d1)
-    t_h4 = trend_score(h4)
-    overall = t_d1 + t_h4
+def build_signal(name: str, symbol: str) -> Optional[str]:
+    d1 = fetch_ohlc(symbol, "1d", PERIOD_D1)
+    h4 = fetch_ohlc(symbol, "4h", PERIOD_H4)
+    m30 = fetch_ohlc(symbol, "30m", PERIOD_M30)
 
-    close15 = m15["Close"]
-    e20_15 = ema(close15, 20)
+    td = trend_score(d1)
+    th = trend_score(h4)
+    overall = td + th
 
-    trigger_up = close15.iloc[-1] > e20_15.iloc[-1]
-    trigger_dn = close15.iloc[-1] < e20_15.iloc[-1]
+    # Strict: only +2 / -2
+    if overall not in (-2, 2):
+        return None
 
-    if overall >= +1 and trigger_up:
-        return "BUY", overall
-    if overall <= -1 and trigger_dn:
-        return "SELL", overall
-    return "WAIT", overall
+    direction = "BUY" if overall == 2 else "SELL"
 
+    # M30 pro filters
+    if not atr_ok_m30(m30):
+        return None
+    if not candle_confirm_m30(m30, direction):
+        return None
+    if not bos_m30(m30, direction):
+        return None
 
-def _fmt_levels(xs: List[float]) -> str:
-    return ", ".join([f"{x:.2f}" for x in xs]) if xs else "N/A"
+    price = float(m30["Close"].iloc[-1])
+    a30 = atr(m30, 14)
 
+    ob = find_order_block_m30(m30, direction)
+    fvgs = find_fvg_m30(m30, direction, max_items=2)
 
-def build_message(name: str, symbol: str) -> Optional[Tuple[str, str]]:
-    """
-    Returns (message, signature) or None.
-    signature = key used to prevent spamming.
-    """
-    d1 = fetch_ohlc(symbol, *TF_D1)
-    h4 = fetch_ohlc(symbol, *TF_H4)
-    m30 = fetch_ohlc(symbol, *TF_M30)
-    m15 = fetch_ohlc(symbol, *TF_M15)
+    best_zone = None
+    best_name = None
+    if ob:
+        best_zone = ob
+        best_name = "OrderBlock"
+    elif fvgs:
+        best_zone = fvgs[-1]
+        best_name = "FVG"
+    else:
+        return None
 
-    price = float(m15["Close"].iloc[-1])
-    signal, overall = decide_signal(d1, h4, m30, m15)
+    risk_usd = round(ACCOUNT_USD * (RISK_PCT / 100.0), 2)
+    emoji = "🔵" if direction == "BUY" else "🔴"
 
-    supports, resistances = swing_levels(h4, lookback=140)
-    bull_fvg, bear_fvg = find_fvgs(m30, max_items=2)
+    # ✅ Market إذا لمس المنطقة
+    if price_touches_zone(price, best_zone, a30):
+        entry = price  # Market at current M30 close
+        if direction == "BUY":
+            sl = best_zone[0] - (a30 * SL_BUFFER_ATR)
+        else:
+            sl = best_zone[1] + (a30 * SL_BUFFER_ATR)
 
-    if signal == "WAIT":
-        if not SEND_WAIT:
-            return None
+        tp1, tp2, tp3 = calc_tps(direction, entry, sl)
+
         msg = (
             f"📌 {name} ({symbol})\n"
-            f"Trend D1+H4: Overall: {overall}\n"
-            f"Signal: ⏳ WAIT\n"
-            f"Price: {price:.2f}\n"
+            f"Trend D1/H4: {td:+d} / {th:+d} => Overall: {overall:+d}\n\n"
+            f"{emoji} {direction} (MARKET): {entry:.2f}\n"
+            f"SL: {sl:.2f}\n"
+            f"TP1: {tp1:.2f}\n"
+            f"TP2: {tp2:.2f}\n"
+            f"TP3: {tp3:.2f}\n\n"
+            f"Zone: {best_name} [{best_zone[0]:.2f} - {best_zone[1]:.2f}]\n"
+            f"Risk: {int(RISK_PCT)}% (~${risk_usd})\n"
+            f"TF: M30 Pro (Candle+BOS)"
         )
-        sig = f"{name}|WAIT|{overall}"
-        return msg, sig
+        return msg
 
-    if signal == "BUY":
-        ob = find_orderblock(m30, "BUY")
-        entry_pending = ob.mid if ob else (supports[0] if supports else price)
-        entry_market = price
+    # ✅ وإلا Pending عند منتصف المنطقة (إذا ليست بعيدة جدًا)
+    entry = zone_mid(best_zone)
+    if abs(entry - price) > (MAX_PENDING_DISTANCE_ATR * a30):
+        return None
 
-        sl_ref = ob.low if ob else (supports[0] if supports else price)
-        sl_market = min(sl_ref, entry_market) - max(entry_market * 0.001, 0.5)
-        tp1, tp2, tp3 = calc_levels("BUY", entry_market, sl_market)
-
-        sl_pending = (ob.low if ob else entry_pending) - max(entry_pending * 0.001, 0.5)
-        tp1p, tp2p, tp3p = calc_levels("BUY", entry_pending, sl_pending)
-
-        far = abs(price - entry_pending) > max(price * 0.002, 1.0)
-
-        if far:
-            msg = (
-                f"📌 {name} ({symbol})\n"
-                f"Trend D1+H4: Overall: {overall}\n"
-                f"Signal: 🟦 PENDING BUY (BuyLimit)\n"
-                f"BuyLimit: {entry_pending:.2f}\n"
-                f"SL: {sl_pending:.2f}\n"
-                f"TP1: {tp1p:.2f} | TP2: {tp2p:.2f} | TP3: {tp3p:.2f}\n\n"
-                f"Supports: {_fmt_levels(supports)}\n"
-                f"Resistances: {_fmt_levels(resistances)}\n"
-                f"OrderBlock: {f'[{ob.low:.2f} - {ob.high:.2f}]' if ob else 'N/A'}\n"
-                f"FVG Bull: {', '.join([f'[{a:.2f}-{b:.2f}]' for a,b in bull_fvg]) or 'N/A'}\n"
-            )
-            sig = f"{name}|PBUY|{overall}|{entry_pending:.2f}|{sl_pending:.2f}|{tp1p:.2f}|{tp2p:.2f}|{tp3p:.2f}"
-        else:
-            msg = (
-                f"📌 {name} ({symbol})\n"
-                f"Trend D1+H4: Overall: {overall}\n"
-                f"Signal: 🔵 BUY\n"
-                f"Entry: {entry_market:.2f}\n"
-                f"SL: {sl_market:.2f}\n"
-                f"TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n\n"
-                f"Pending (Level): BuyLimit {entry_pending:.2f}\n"
-                f"SL: {sl_pending:.2f}\n"
-                f"TP1: {tp1p:.2f} | TP2: {tp2p:.2f} | TP3: {tp3p:.2f}\n"
-            )
-            sig = f"{name}|BUY|{overall}|{sl_market:.2f}|{tp1:.2f}|{tp2:.2f}|{tp3:.2f}|{entry_pending:.2f}"
-
-        return msg, sig
-
-    if signal == "SELL":
-        ob = find_orderblock(m30, "SELL")
-        entry_pending = ob.mid if ob else (resistances[0] if resistances else price)
-        entry_market = price
-
-        sl_ref = ob.high if ob else (resistances[0] if resistances else price)
-        sl_market = max(sl_ref, entry_market) + max(entry_market * 0.001, 0.5)
-        tp1, tp2, tp3 = calc_levels("SELL", entry_market, sl_market)
-
-        sl_pending = (ob.high if ob else entry_pending) + max(entry_pending * 0.001, 0.5)
-        tp1p, tp2p, tp3p = calc_levels("SELL", entry_pending, sl_pending)
-
-        far = abs(price - entry_pending) > max(price * 0.002, 1.0)
-
-        if far:
-            msg = (
-                f"📌 {name} ({symbol})\n"
-                f"Trend D1+H4: Overall: {overall}\n"
-                f"Signal: 🟥 PENDING SELL (SellLimit)\n"
-                f"SellLimit: {entry_pending:.2f}\n"
-                f"SL: {sl_pending:.2f}\n"
-                f"TP1: {tp1p:.2f} | TP2: {tp2p:.2f} | TP3: {tp3p:.2f}\n\n"
-                f"Supports: {_fmt_levels(supports)}\n"
-                f"Resistances: {_fmt_levels(resistances)}\n"
-                f"OrderBlock: {f'[{ob.low:.2f} - {ob.high:.2f}]' if ob else 'N/A'}\n"
-                f"FVG Bear: {', '.join([f'[{a:.2f}-{b:.2f}]' for a,b in bear_fvg]) or 'N/A'}\n"
-            )
-            sig = f"{name}|PSELL|{overall}|{entry_pending:.2f}|{sl_pending:.2f}|{tp1p:.2f}|{tp2p:.2f}|{tp3p:.2f}"
-        else:
-            msg = (
-                f"📌 {name} ({symbol})\n"
-                f"Trend D1+H4: Overall: {overall}\n"
-                f"Signal: 🔴 SELL\n"
-                f"Entry: {entry_market:.2f}\n"
-                f"SL: {sl_market:.2f}\n"
-                f"TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n\n"
-                f"Pending (Level): SellLimit {entry_pending:.2f}\n"
-                f"SL: {sl_pending:.2f}\n"
-                f"TP1: {tp1p:.2f} | TP2: {tp2p:.2f} | TP3: {tp3p:.2f}\n"
-            )
-            sig = f"{name}|SELL|{overall}|{sl_market:.2f}|{tp1:.2f}|{tp2:.2f}|{tp3:.2f}|{entry_pending:.2f}"
-
-        return msg, sig
-
-    return None
-
-
-# =========================
-# Main loop
-# =========================
-def run():
-    if not BOT_TOKEN or not CHAT_ID:
-        logging.warning("BOT_TOKEN/CHAT_ID missing. Bot will not send messages until set.")
+    if direction == "BUY":
+        sl = best_zone[0] - (a30 * SL_BUFFER_ATR)
+        order_name = "Buy Limit"
     else:
-        send_telegram_message("✅ Bot started on Railway. Auto-signals running.")
+        sl = best_zone[1] + (a30 * SL_BUFFER_ATR)
+        order_name = "Sell Limit"
 
-    last_sent_sig: Dict[str, str] = {}
-    last_error_sent_at: Dict[str, float] = {}  # per symbol
+    tp1, tp2, tp3 = calc_tps(direction, entry, sl)
+
+    msg = (
+        f"📌 {name} ({symbol})\n"
+        f"Trend D1/H4: {td:+d} / {th:+d} => Overall: {overall:+d}\n\n"
+        f"{'🟢' if direction=='BUY' else '🔴'} {order_name}: {entry:.2f}\n"
+        f"SL: {sl:.2f}\n"
+        f"TP1: {tp1:.2f}\n"
+        f"TP2: {tp2:.2f}\n"
+        f"TP3: {tp3:.2f}\n\n"
+        f"Zone: {best_name} [{best_zone[0]:.2f} - {best_zone[1]:.2f}]\n"
+        f"Risk: {int(RISK_PCT)}% (~${risk_usd})\n"
+        f"TF: M30 Pro (Candle+BOS)"
+    )
+    return msg
+
+
+# =========================
+# Cache / Anti-spam
+# =========================
+def msg_hash(msg: str) -> str:
+    return hashlib.sha256(msg.encode("utf-8")).hexdigest()
+
+def main():
+    if BOT_TOKEN and CHAT_ID:
+        tg_send("✅ Bot started (M30 Pro: Market on Touch + Pending OB/FVG)")
+
+    last_hash: Dict[str, str] = {}
+    last_time: Dict[str, float] = {}
 
     while True:
-        for name, sym in SYMBOLS.items():
-            try:
-                built = build_message(name, sym)
-                if not built:
+        try:
+            now = time.time()
+
+            for name, sym in SYMBOLS.items():
+                prev = last_time.get(name, 0.0)
+                if (now - prev) < (COOLDOWN_MINUTES * 60):
                     continue
 
-                msg, sig = built
-                if last_sent_sig.get(name) != sig:
-                    if send_telegram_message(msg):
-                        last_sent_sig[name] = sig
-                        logging.info("Sent update for %s", name)
+                try:
+                    msg = build_signal(name, sym)
+                except Exception as e:
+                    logging.error("Build error %s (%s): %s", name, sym, e)
+                    continue
 
-            except Exception as e:
-                logging.error("Error on %s (%s): %s", name, sym, e)
+                if not msg:
+                    continue
 
-                # optional: notify to telegram but with cooldown
-                now = time.time()
-                last_t = last_error_sent_at.get(name, 0)
-                if BOT_TOKEN and CHAT_ID and (now - last_t) >= ERROR_NOTIFY_COOLDOWN_SEC:
-                    send_telegram_message(f"⚠️ Error on {name} ({sym}): {str(e)[:150]}")
-                    last_error_sent_at[name] = now
+                h = msg_hash(msg)
+                if last_hash.get(name) == h:
+                    continue
 
-        time.sleep(CHECK_INTERVAL)
+                if tg_send(msg):
+                    last_hash[name] = h
+                    last_time[name] = now
+                    logging.info("Sent %s", name)
+                    time.sleep(1)
+
+            time.sleep(CHECK_INTERVAL_SEC)
+
+        except Exception as e:
+            logging.error("Main loop error: %s", e)
+            time.sleep(10)
 
 
 if __name__ == "__main__":
-    run()
+    main()
