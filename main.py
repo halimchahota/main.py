@@ -1,26 +1,23 @@
 import os
-import io
 import time
 import math
-import json
-import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
-import numpy as np
-import pandas as pd
 import requests
-import yfinance as yf
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import mplfinance as mpf
 
 
 # =========================
-# ENV / SETTINGS
+# Environment / Config
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # "@channel" OR "-100xxxxxxxxxx"
+CHAT_ID = os.getenv("CHAT_ID", "").strip()  # مثال صحيح: @abdel_tra  أو -1001234567890
 
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
@@ -28,157 +25,123 @@ RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
-# Strategy toggles
-USE_EMA_FILTER = os.getenv("USE_EMA_FILTER", "1").strip() == "1"
-USE_RETEST = os.getenv("USE_RETEST", "1").strip() == "1"
+# ATR / Zones behavior
+TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))           # لمس المنطقة = دخول Market
+RETEST_ATR = float(os.getenv("RETEST_ATR", "0.35"))                   # نفس الفكرة (اختياري)
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.5"))  # أقصى بعد أمر معلق
+SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))             # هامش SL خارج المنطقة
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))                # فلتر تذبذب مبالغ فيه
+INVALID_ATR = float(os.getenv("INVALID_ATR", "0.0"))                  # لو ATR أقل من كذا اعتبره غير صالح
 
-# EMA
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+YF_RETRIES = int(os.getenv("YF_RETRIES", "3"))
+
+# EMAs
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_MID = int(os.getenv("EMA_MID", "50"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "200"))
 
-# ATR / zones
-MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
-SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
-MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.5"))
-
-# Retest
-RETEST_MODE = os.getenv("RETEST_MODE", "touch").strip().lower()  # "touch" or "mid"
-RETEST_ATR = float(os.getenv("RETEST_ATR", "0.35"))
-INVALID_ATR = float(os.getenv("INVALID_ATR", "0.20"))
-
-# BOS / candle confirm
-BOS_LOOKBACK = int(os.getenv("BOS_LOOKBACK", "10"))
-
-# RR targets (1R/2R/3R)
-TP_R1 = float(os.getenv("TP_R1", "1"))
-TP_R2 = float(os.getenv("TP_R2", "2"))
-TP_R3 = float(os.getenv("TP_R3", "3"))
-
-# Chart
-CHART_BARS = int(os.getenv("CHART_BARS", "160"))
-
-# Timeframes (Yahoo)
-TF_SIGNAL = "30m"
-PERIOD_SIGNAL = os.getenv("PERIOD_SIGNAL", "14d")
-PERIOD_D1 = os.getenv("PERIOD_D1", "200d")
-PERIOD_H1 = os.getenv("PERIOD_H1", "90d")  # build H4 from H1 resample
-
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-STATE_FILE = os.getenv("STATE_FILE", "/tmp/vip_bot_state.json")
-
-SYMBOLS: Dict[str, str] = {
-    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
-    "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
-    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
-    "US30": os.getenv("US30_SYMBOL", "^DJI"),
-    "OIL": os.getenv("OIL_SYMBOL", "CL=F"),
+# Symbols (Yahoo)
+SYMBOLS: Dict[str, List[str]] = {
+    # Gold: أحيانًا GC=F يفشل على Railway، لذلك نضع بدائل
+    "XAU": ["XAUUSD=X", "GC=F"],
+    "BTC": ["BTC-USD"],
+    "US100": ["NQ=F"],
+    "US30": ["YM=F", "^DJI"],     # YM=F أفضل عادةً، ^DJI بديل
+    "OIL": ["CL=F"],
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+# =========================
+# Logging
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
 
 
 # =========================
-# Telegram (PHOTO first + fallback TEXT)
+# Telegram Helpers
 # =========================
-def tg_send_photo(caption: str, image_bytes: bytes) -> None:
+def _telegram_url(method: str) -> str:
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+
+def send_telegram_photo_with_caption(photo_bytes: bytes, caption: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("BOT_TOKEN / CHAT_ID missing (Railway Variables).")
-
-    caption = (caption or "")[:1000]  # ✅ avoid Telegram caption limit 1024
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("chart.png", image_bytes, "image/png")}
-    data = {"chat_id": CHAT_ID, "caption": caption}
-
-    r = requests.post(url, data=data, files=files, timeout=REQUEST_TIMEOUT)
-    if not r.ok:
-        raise RuntimeError(f"Telegram sendPhoto error {r.status_code}: {r.text}")
-
-
-def tg_send_text(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("BOT_TOKEN / CHAT_ID missing (Railway Variables).")
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
-
-    r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    if not r.ok:
-        raise RuntimeError(f"Telegram sendMessage error {r.status_code}: {r.text}")
-
-
-# =========================
-# State / Anti-spam
-# =========================
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"sent": {}}
-
-
-def save_state(state: dict) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-    except Exception:
-        pass
-
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-def sha(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def cooldown_ok(state: dict, key: str) -> bool:
-    rec = state.get("sent", {}).get(key)
-    if not rec:
-        return True
-    last = int(rec.get("ts", 0))
-    return (now_ts() - last) >= COOLDOWN_MINUTES * 60
-
-
-def already_sent_same(state: dict, key: str, sig: str) -> bool:
-    rec = state.get("sent", {}).get(key)
-    if not rec:
+        logging.error("BOT_TOKEN or CHAT_ID missing.")
         return False
-    return rec.get("sig") == sig
 
-
-def mark_sent(state: dict, key: str, sig: str) -> None:
-    state.setdefault("sent", {})[key] = {"ts": now_ts(), "sig": sig}
+    try:
+        files = {"photo": ("chart.png", photo_bytes, "image/png")}
+        data = {
+            "chat_id": CHAT_ID,
+            "caption": caption[:1024],  # Telegram caption limit
+            "parse_mode": "HTML"
+        }
+        r = requests.post(_telegram_url("sendPhoto"), data=data, files=files, timeout=REQUEST_TIMEOUT)
+        if not r.ok:
+            logging.error("Telegram sendPhoto failed: %s | %s", r.status_code, r.text)
+            return False
+        return True
+    except Exception as e:
+        logging.error("Telegram sendPhoto error: %s", e)
+        return False
 
 
 # =========================
-# Market data
+# Market Data (yfinance)
 # =========================
-def norm_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    df = df.rename(columns=str.title).dropna()
-    need = {"Open", "High", "Low", "Close"}
-    if not need.issubset(df.columns):
-        return pd.DataFrame()
-    return df
+def yf_download(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    import yfinance as yf
+    last_err = None
 
+    for _ in range(max(1, YF_RETRIES)):
+        try:
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                progress=False,
+                auto_adjust=True,
+                threads=False
+            )
+            if df is None or df.empty:
+                last_err = f"empty df for {symbol} {period} {interval}"
+                time.sleep(1.2)
+                continue
 
-def yf_fetch(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    df = yf.download(symbol, interval=interval, period=period, progress=False, auto_adjust=False)
-    return norm_df(df)
+            # Normalize columns
+            if isinstance(df.columns, pd.MultiIndex):
+                # Take first level if needed (sometimes yfinance returns ('Close', 'BTC-USD') style)
+                df.columns = [c[0] for c in df.columns]
 
+            needed = {"Open", "High", "Low", "Close"}
+            if not needed.issubset(set(df.columns)):
+                last_err = f"missing columns {needed - set(df.columns)} for {symbol}"
+                time.sleep(1.2)
+                continue
 
-def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    o = df["Open"].resample(rule).first()
-    h = df["High"].resample(rule).max()
-    l = df["Low"].resample(rule).min()
-    c = df["Close"].resample(rule).last()
-    return pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}).dropna()
+            df = df.dropna()
+            if df.empty:
+                last_err = f"all NaN after dropna for {symbol}"
+                time.sleep(1.2)
+                continue
+
+            return df
+
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1.2)
+
+    logging.error("yfinance download failed: %s | %s", symbol, last_err)
+    return None
+
+def get_best_df(symbol_candidates: List[str], period: str, interval: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    for sym in symbol_candidates:
+        df = yf_download(sym, period=period, interval=interval)
+        if df is not None and not df.empty:
+            return df, sym
+    return None, None
 
 
 # =========================
@@ -187,426 +150,531 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
-
-def atr(df: pd.DataFrame, n: int = 14) -> float:
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
     prev_close = close.shift(1)
 
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    v = tr.rolling(n).mean().iloc[-1]
-    if v is None or (isinstance(v, float) and math.isnan(v)):
-        return float(tr.iloc[-1])
-    return float(v)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
 
+    return tr.rolling(n).mean()
 
 def trend_score(df: pd.DataFrame) -> int:
-    # +1 bullish, -1 bearish, 0 neutral (EMA50/EMA200 + slope)
-    if df.empty or len(df) < 80:
-        return 0
     c = df["Close"]
-    e50 = ema(c, 50)
-    e200 = ema(c, 200) if len(df) >= 200 else ema(c, 100)
-    slope = float(e50.iloc[-1] - e50.iloc[-10]) if len(e50) >= 11 else 0.0
+    e50 = ema(c, EMA_MID)
+    e200 = ema(c, EMA_SLOW)
 
-    if (c.iloc[-1] > e50.iloc[-1] > e200.iloc[-1]) and slope > 0:
+    if len(c) < EMA_SLOW + 5:
+        return 0
+
+    # بسيط وعملي
+    if e50.iloc[-1] > e200.iloc[-1]:
         return +1
-    if (c.iloc[-1] < e50.iloc[-1] < e200.iloc[-1]) and slope < 0:
+    elif e50.iloc[-1] < e200.iloc[-1]:
         return -1
     return 0
 
 
-def ema_filter_ok(df: pd.DataFrame, direction: str) -> bool:
-    # BUY: Close > EMA_SLOW & EMA_FAST > EMA_MID > EMA_SLOW
-    # SELL: Close < EMA_SLOW & EMA_FAST < EMA_MID < EMA_SLOW
-    if df.empty or len(df) < EMA_SLOW + 5:
-        return False
-    close = df["Close"]
-    ef = float(ema(close, EMA_FAST).iloc[-1])
-    em = float(ema(close, EMA_MID).iloc[-1])
-    es = float(ema(close, EMA_SLOW).iloc[-1])
-    c = float(close.iloc[-1])
+# =========================
+# S/R (simple swing)
+# =========================
+def swing_levels(df: pd.DataFrame, lookback: int = 120) -> Tuple[List[float], List[float]]:
+    d = df.tail(lookback).copy()
+    highs = d["High"].values
+    lows = d["Low"].values
 
-    if direction == "BUY":
-        return (c > es) and (ef > em > es)
-    return (c < es) and (ef < em < es)
+    # استخراج قمم/قيعان بسيطة
+    resistances = []
+    supports = []
 
+    for i in range(2, len(d) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+            resistances.append(float(highs[i]))
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            supports.append(float(lows[i]))
 
-def candle_confirm_m30(m30: pd.DataFrame, direction: str) -> bool:
-    o = float(m30["Open"].iloc[-1])
-    c = float(m30["Close"].iloc[-1])
-    return (c > o) if direction == "BUY" else (c < o)
+    # خذ أقرب 3 مستويات
+    price = float(d["Close"].iloc[-1])
+    supports = sorted(set(supports), key=lambda x: abs(price - x))[:3]
+    resistances = sorted(set(resistances), key=lambda x: abs(price - x))[:3]
 
-
-def bos_m30(m30: pd.DataFrame, direction: str, lookback: int) -> bool:
-    if m30.empty or len(m30) < lookback + 2:
-        return False
-    d = m30.tail(lookback + 2)
-    last_close = float(d["Close"].iloc[-1])
-    prev_high = float(d["High"].iloc[:-1].max())
-    prev_low = float(d["Low"].iloc[:-1].min())
-    return (last_close > prev_high) if direction == "BUY" else (last_close < prev_low)
+    return supports, resistances
 
 
 # =========================
-# Zones: OrderBlock + FVG (M30)
+# FVG (Fair Value Gap)
 # =========================
-@dataclass
-class Zone:
-    low: float
-    high: float
-    name: str  # "OrderBlock" or "FVG"
-    side: str  # "BULL" or "BEAR"
+def find_fvg(df: pd.DataFrame, max_items: int = 2) -> List[Tuple[str, float, float]]:
+    """
+    Bullish FVG: Low[i] > High[i-2]  => gap [High[i-2], Low[i]]
+    Bearish FVG: High[i] < Low[i-2]  => gap [High[i], Low[i-2]]
+    """
+    out = []
+    if len(df) < 5:
+        return out
 
-    @property
-    def mid(self) -> float:
-        return (self.low + self.high) / 2.0
+    d = df.tail(200).copy().reset_index(drop=True)
+    for i in range(2, len(d)):
+        h2 = float(d.loc[i-2, "High"])
+        l2 = float(d.loc[i-2, "Low"])
+        hi = float(d.loc[i, "High"])
+        li = float(d.loc[i, "Low"])
+
+        if li > h2:
+            out.append(("BULL_FVG", h2, li))
+        if hi < l2:
+            out.append(("BEAR_FVG", hi, l2))
+
+    # آخر الفجوات أهم
+    return out[-max_items:]
 
 
-def find_order_block_m30(m30: pd.DataFrame, direction: str) -> Optional[Zone]:
-    if m30.empty or len(m30) < 60:
+# =========================
+# Order Block (practical heuristic)
+# =========================
+def find_order_block(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
+    """
+    Heuristic:
+    - BUY: آخر شمعة هابطة قبل تسارع صاعد (close أعلى من EMA20)
+    - SELL: آخر شمعة صاعدة قبل تسارع هابط (close أقل من EMA20)
+    """
+    if len(df) < 50:
         return None
 
-    w = m30.tail(160).copy()
-    bodies = (w["Close"] - w["Open"]).abs()
-    thr = float(bodies.quantile(0.75))
+    d = df.tail(200).copy()
+    c = d["Close"]
+    e20 = ema(c, EMA_FAST)
 
-    for i in range(len(w) - 3, 15, -1):
-        o = float(w["Open"].iloc[i])
-        c = float(w["Close"].iloc[i])
-        lo = float(w["Low"].iloc[i])
-        hi = float(w["High"].iloc[i])
-
-        next_body = abs(float(w["Close"].iloc[i + 1]) - float(w["Open"].iloc[i + 1]))
-        if next_body < thr:
-            continue
+    # امشي للخلف وابحث عن "آخر شمعة عكس الاتجاه" قبل بروز الاتجاه الحالي
+    for i in range(len(d) - 2, 10, -1):
+        o = float(d["Open"].iloc[i])
+        cl = float(d["Close"].iloc[i])
+        hi = float(d["High"].iloc[i])
+        lo = float(d["Low"].iloc[i])
 
         if direction == "BUY":
-            if c < o and float(w["Close"].iloc[i + 1]) > float(w["Open"].iloc[i + 1]):
-                return Zone(low=min(lo, hi), high=max(lo, hi), name="OrderBlock", side="BULL")
+            # شمعة هابطة
+            if cl < o and float(c.iloc[i+1]) > float(e20.iloc[i+1]) and float(c.iloc[-1]) > float(e20.iloc[-1]):
+                # zone = جسم الشمعة (أفضل من كامل الذيل)
+                top = max(o, cl)
+                bot = min(o, cl)
+                # fallback لو جسم صغير جدًا
+                if abs(top - bot) < (hi - lo) * 0.25:
+                    top, bot = hi, lo
+                return (bot, top)
 
         if direction == "SELL":
-            if c > o and float(w["Close"].iloc[i + 1]) < float(w["Open"].iloc[i + 1]):
-                return Zone(low=min(lo, hi), high=max(lo, hi), name="OrderBlock", side="BEAR")
-
-    return None
-
-
-def find_fvg_m30(m30: pd.DataFrame, direction: str) -> Optional[Zone]:
-    if m30.empty or len(m30) < 30:
-        return None
-
-    d = m30.tail(400)
-    h = d["High"].values
-    l = d["Low"].values
-
-    if direction == "BUY":
-        for i in range(len(d) - 1, 2, -1):
-            if l[i] > h[i - 2]:
-                return Zone(low=float(h[i - 2]), high=float(l[i]), name="FVG", side="BULL")
-    else:
-        for i in range(len(d) - 1, 2, -1):
-            if h[i] < l[i - 2]:
-                return Zone(low=float(h[i]), high=float(l[i - 2]), name="FVG", side="BEAR")
+            # شمعة صاعدة
+            if cl > o and float(c.iloc[i+1]) < float(e20.iloc[i+1]) and float(c.iloc[-1]) < float(e20.iloc[-1]):
+                top = max(o, cl)
+                bot = min(o, cl)
+                if abs(top - bot) < (hi - lo) * 0.25:
+                    top, bot = hi, lo
+                return (bot, top)
 
     return None
 
 
 # =========================
-# RETEST VIP+
+# Signal logic (M30 + D1/H4 bias)
 # =========================
-def retest_decision(direction: str, price: float, zone: Zone, a30: float) -> Tuple[str, float]:
-    """
-    Returns (MODE, entry)
-    MODE:
-      - "MARKET": touched zone now => entry=current price
-      - "PENDING": wait => entry=zone.mid
-      - "CANCEL": invalidation => no trade
-    """
-    zlow, zhigh = zone.low, zone.high
-    mid = zone.mid
+@dataclass
+class Signal:
+    symbol_key: str
+    symbol_used: str
+    price: float
 
-    # invalidation
-    if direction == "BUY":
-        if price < (zlow - INVALID_ATR * a30):
-            return "CANCEL", mid
-    else:
-        if price > (zhigh + INVALID_ATR * a30):
-            return "CANCEL", mid
+    trend_d1: int
+    trend_h4: int
+    overall: int
 
-    # touch logic
-    if RETEST_MODE == "mid":
-        touched = abs(price - mid) <= (RETEST_ATR * a30)
-    else:
-        touched = (zlow <= price <= zhigh) or (abs(price - mid) <= (RETEST_ATR * a30))
+    side: str  # "BUY" or "SELL" or "NONE"
+    order_type: str  # "MARKET" or "LIMIT" or "NONE"
 
-    if touched:
-        return "MARKET", price
-    return "PENDING", mid
+    entry: Optional[float]
+    sl: Optional[float]
+    tp1: Optional[float]
+    tp2: Optional[float]
+    tp3: Optional[float]
 
+    zone_name: str
+    zone_low: Optional[float]
+    zone_high: Optional[float]
 
-# =========================
-# SL / TP (RR correct & monotonic)
-# =========================
-def calc_sl_tp(direction: str, entry: float, zone: Zone, a30: float) -> Tuple[float, float, float, float]:
-    """
-    SL beyond zone by SL_BUFFER_ATR*ATR
-    TP based on true R = abs(entry - SL)
-    """
-    if direction == "BUY":
-        sl = zone.low - (SL_BUFFER_ATR * a30)
-        R = abs(entry - sl)
-        tp1 = entry + TP_R1 * R
-        tp2 = entry + TP_R2 * R
-        tp3 = entry + TP_R3 * R
-        # ensure monotonic
-        tp1, tp2, tp3 = sorted([tp1, tp2, tp3])
-    else:
-        sl = zone.high + (SL_BUFFER_ATR * a30)
-        R = abs(sl - entry)
-        tp1 = entry - TP_R1 * R
-        tp2 = entry - TP_R2 * R
-        tp3 = entry - TP_R3 * R
-        tp1, tp2, tp3 = sorted([tp1, tp2, tp3], reverse=True)
+    fvg_items: List[Tuple[str, float, float]]
+    supports: List[float]
+    resistances: List[float]
 
-    # round ONLY at end
-    return round(sl, 2), round(tp1, 2), round(tp2, 2), round(tp3, 2)
+    confidence: int
+    risk_usd: float
 
 
-# =========================
-# Chart rendering (Candles + EMAs + Zone + Levels)
-# =========================
-def render_chart(m30: pd.DataFrame, sig: dict) -> bytes:
-    plot_df = m30.copy().tail(CHART_BARS)
-    plot_df.index.name = "Date"
-
-    plot_df["EMA20"] = plot_df["Close"].ewm(span=20, adjust=False).mean()
-    plot_df["EMA50"] = plot_df["Close"].ewm(span=50, adjust=False).mean()
-    plot_df["EMA200"] = plot_df["Close"].ewm(span=200, adjust=False).mean()
-
-    zone: Zone = sig["zone"]
-    entry = sig["entry"]
-    sl = sig["sl"]
-    tp1, tp2, tp3 = sig["tp1"], sig["tp2"], sig["tp3"]
-
-    apds = [
-        mpf.make_addplot(plot_df["EMA20"], width=1.0),
-        mpf.make_addplot(plot_df["EMA50"], width=1.0),
-        mpf.make_addplot(plot_df["EMA200"], width=1.2),
-    ]
-
-    hlines = [entry, sl, tp1, tp2, tp3]
-    colors = ["g", "r", "k", "k", "k"]
-
-    fig = mpf.figure(figsize=(10, 6), dpi=150)
-    ax = fig.add_subplot(1, 1, 1)
-
-    mpf.plot(
-        plot_df,
-        type="candle",
-        ax=ax,
-        volume=False,
-        style="yahoo",
-        addplot=apds,
-        hlines=dict(hlines=hlines, colors=colors, linewidths=[1.2, 1.2, 1.0, 1.0, 1.0], alpha=0.9),
-        axtitle=f"{sig['name']} ({sig['ticker']}) - M30 | EMA20/50/200",
-    )
-
-    # zone highlight
-    ax.axhspan(zone.low, zone.high, xmin=0.0, xmax=1.0, alpha=0.12)
-
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
+def compute_confidence(overall: int, m30_dir: int, touched: bool, has_zone: bool) -> int:
+    score = 5
+    score += 2 if overall > 0 else 0
+    score += 2 if overall < 0 else 0
+    score += 2 if m30_dir != 0 and (overall == 0 or (overall > 0 and m30_dir > 0) or (overall < 0 and m30_dir < 0)) else -1
+    score += 1 if has_zone else 0
+    score += 1 if touched else 0
+    return max(1, min(10, score))
 
 
-# =========================
-# Build signal
-# =========================
-def build_signal(symbol_name: str, ticker: str) -> Optional[dict]:
-    # M30 data
-    m30 = yf_fetch(ticker, TF_SIGNAL, PERIOD_SIGNAL)
-    if m30.empty or len(m30) < 120:
+def m30_direction(df30: pd.DataFrame) -> int:
+    c = df30["Close"]
+    e20 = ema(c, EMA_FAST)
+    e50 = ema(c, EMA_MID)
+
+    if len(c) < 60:
+        return 0
+
+    # شرط بسيط: EMA20 فوق EMA50 + آخر إغلاق فوق EMA20 = صعود
+    if e20.iloc[-1] > e50.iloc[-1] and c.iloc[-1] > e20.iloc[-1]:
+        return +1
+    if e20.iloc[-1] < e50.iloc[-1] and c.iloc[-1] < e20.iloc[-1]:
+        return -1
+    return 0
+
+
+def build_signal(symbol_key: str) -> Optional[Signal]:
+    # D1/H4 bias
+    d1, used1 = get_best_df(SYMBOLS[symbol_key], period="180d", interval="1d")
+    h4, used4 = get_best_df(SYMBOLS[symbol_key], period="120d", interval="4h")
+    m30, used30 = get_best_df(SYMBOLS[symbol_key], period="60d", interval="30m")
+
+    symbol_used = used30 or used4 or used1
+    if d1 is None or h4 is None or m30 is None or symbol_used is None:
+        logging.error("[%s] No data (D1/H4/M30) - skip", symbol_key)
         return None
 
-    # Trend frames
-    d1 = yf_fetch(ticker, "1d", PERIOD_D1)
-    h1 = yf_fetch(ticker, "60m", PERIOD_H1)
-    if d1.empty or h1.empty:
-        return None
-    h4 = resample_ohlc(h1, "4H")
-    if h4.empty:
-        return None
-
-    td = trend_score(d1)
-    th = trend_score(h4)
-    overall = td + th
-
-    # strict trend
-    if overall not in (-2, 2):
-        return None
-
-    direction = "BUY" if overall == 2 else "SELL"
     price = float(m30["Close"].iloc[-1])
 
-    # ATR filter
-    a30 = atr(m30, 14)
-    if not np.isfinite(a30) or a30 <= 0:
-        return None
-    if (a30 / price) > MAX_ATR_PCT:
+    t_d1 = trend_score(d1)
+    t_h4 = trend_score(h4)
+    overall = t_d1 + t_h4
+
+    # ATR on M30
+    a = atr(m30, 14)
+    atr_now = float(a.iloc[-1]) if not math.isnan(a.iloc[-1]) else 0.0
+    if atr_now <= INVALID_ATR:
+        logging.error("[%s] Invalid ATR (%.6f).", symbol_key, atr_now)
         return None
 
-    # M30 confirm: candle + BOS
-    if not candle_confirm_m30(m30, direction):
-        return None
-    if not bos_m30(m30, direction, BOS_LOOKBACK):
+    # فلتر تذبذب مبالغ فيه
+    if price > 0 and (atr_now / price) > MAX_ATR_PCT:
+        logging.warning("[%s] ATR pct too high (%.4f) => skip", symbol_key, atr_now / price)
         return None
 
-    # EMA filter
-    if USE_EMA_FILTER and not ema_filter_ok(m30, direction):
-        return None
+    # M30 direction
+    m30_dir = m30_direction(m30)
+
+    # تحديد اتجاه نهائي:
+    # - إذا overall قوي (+2/-2) نعتمده
+    # - إذا overall ضعيف نأخذ M30
+    side = "NONE"
+    if overall >= 1 and m30_dir >= 0:
+        side = "BUY"
+    elif overall <= -1 and m30_dir <= 0:
+        side = "SELL"
+    else:
+        # fallback
+        if m30_dir > 0:
+            side = "BUY"
+        elif m30_dir < 0:
+            side = "SELL"
+        else:
+            side = "NONE"
+
+    if side == "NONE":
+        return Signal(
+            symbol_key=symbol_key,
+            symbol_used=symbol_used,
+            price=price,
+            trend_d1=t_d1,
+            trend_h4=t_h4,
+            overall=overall,
+            side="NONE",
+            order_type="NONE",
+            entry=None, sl=None, tp1=None, tp2=None, tp3=None,
+            zone_name="NONE", zone_low=None, zone_high=None,
+            fvg_items=find_fvg(m30),
+            supports=swing_levels(h4)[0],
+            resistances=swing_levels(h4)[1],
+            confidence=3,
+            risk_usd=ACCOUNT_BALANCE * (RISK_PCT / 100.0),
+        )
 
     # Zones
-    ob = find_order_block_m30(m30, direction)
-    fvg = find_fvg_m30(m30, direction)
-    zone = ob if ob else fvg
-    if not zone:
-        return None
+    ob = find_order_block(m30, side)
+    zone_low, zone_high = (None, None)
+    zone_name = "NONE"
+    if ob:
+        zone_low, zone_high = float(ob[0]), float(ob[1])
+        zone_name = "OrderBlock"
 
-    # distance filter
-    if abs(zone.mid - price) > (MAX_PENDING_DISTANCE_ATR * a30):
-        return None
+    fvg_items = find_fvg(m30)
 
-    # RETEST
-    if USE_RETEST:
-        mode, entry = retest_decision(direction, price, zone, a30)
-        if mode == "CANCEL":
+    # هل السعر لمس المنطقة؟
+    touched = False
+    if zone_low is not None and zone_high is not None:
+        mid = (zone_low + zone_high) / 2.0
+        dist = abs(price - mid)
+        touched = dist <= (TOUCH_ATR_MULT * atr_now)
+
+    # نوع الأمر:
+    # - إذا لمس: Market
+    # - إذا بعيد: Limit على منتصف الـ OB (إذا المسافة معقولة)
+    order_type = "MARKET" if touched else "LIMIT"
+
+    entry = price if order_type == "MARKET" else None
+    if order_type == "LIMIT" and zone_low is not None and zone_high is not None:
+        mid = (zone_low + zone_high) / 2.0
+        if abs(price - mid) <= (MAX_PENDING_DISTANCE_ATR * atr_now):
+            entry = mid
+        else:
+            # بعيد جدًا => لا نرسل إشارة
+            logging.info("[%s] Pending too far. Skip.", symbol_key)
             return None
+
+    # SL/TP
+    risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
+
+    # SL خلف المنطقة + buffer ATR
+    if side == "BUY":
+        base_sl = zone_low if zone_low is not None else (price - 1.2 * atr_now)
+        sl = float(base_sl - SL_BUFFER_ATR * atr_now)
+        r = max(atr_now * 1.5, (price - sl))  # مسافة منطقية
+        tp1 = float((entry or price) + 1.5 * r)
+        tp2 = float((entry or price) + 2.5 * r)
+        tp3 = float((entry or price) + 4.0 * r)
+
     else:
-        mode, entry = "PENDING", zone.mid
+        base_sl = zone_high if zone_high is not None else (price + 1.2 * atr_now)
+        sl = float(base_sl + SL_BUFFER_ATR * atr_now)
+        r = max(atr_now * 1.5, (sl - price))
+        tp1 = float((entry or price) - 1.5 * r)
+        tp2 = float((entry or price) - 2.5 * r)
+        tp3 = float((entry or price) - 4.0 * r)
 
-    sl, tp1, tp2, tp3 = calc_sl_tp(direction, float(entry), zone, a30)
+    supports, resistances = swing_levels(h4)
 
-    # simple confidence
-    conf = 0
-    conf += 4  # strong trend
-    conf += 2  # BOS
-    conf += 2 if USE_EMA_FILTER else 0
-    conf += 2  # zone found
-    conf += 1 if zone.name == "OrderBlock" else 0
-    conf = min(10, conf)
+    conf = compute_confidence(overall=overall, m30_dir=m30_dir, touched=touched, has_zone=(zone_low is not None))
 
-    return {
-        "name": symbol_name,
-        "ticker": ticker,
-        "trend_d1": td,
-        "trend_h4": th,
-        "overall": overall,
-        "direction": direction,
-        "mode": mode,  # MARKET / PENDING
-        "price": round(price, 2),
-        "zone": zone,
-        "entry": round(float(entry), 2),
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "risk_usd": round(ACCOUNT_BALANCE * (RISK_PCT / 100.0), 2),
-        "confidence": conf,
-    }
-
-
-def format_caption(sig: dict) -> str:
-    zone: Zone = sig["zone"]
-    direction = sig["direction"]
-    mode = sig["mode"]
-
-    icon = "🔵" if direction == "BUY" else "🔴"
-    if mode == "PENDING":
-        order = ("Buy Limit" if direction == "BUY" else "Sell Limit") + " (RETEST)"
-    else:
-        order = f"{direction} (RETEST MARKET)"
-
-    return (
-        f"🔥 VIP M30+\n"
-        f"📌 {sig['name']} ({sig['ticker']})\n"
-        f"Trend D1/H4: {sig['trend_d1']:+d} / {sig['trend_h4']:+d} => Overall: {sig['overall']:+d}\n\n"
-        f"{icon} {order}: {sig['entry']:.2f}\n"
-        f"SL: {sig['sl']:.2f}\n"
-        f"TP1: {sig['tp1']:.2f}\n"
-        f"TP2: {sig['tp2']:.2f}\n"
-        f"TP3: {sig['tp3']:.2f}\n\n"
-        f"Zone: {zone.name} [{zone.low:.2f} - {zone.high:.2f}] ({zone.side})\n"
-        f"Risk: {RISK_PCT:.1f}% (~${sig['risk_usd']:.2f})\n"
-        f"EMA Filter: {'ON' if USE_EMA_FILTER else 'OFF'} | Retest: {'ON' if USE_RETEST else 'OFF'}\n"
-        f"Confidence: {sig['confidence']}/10"
+    return Signal(
+        symbol_key=symbol_key,
+        symbol_used=symbol_used,
+        price=price,
+        trend_d1=t_d1,
+        trend_h4=t_h4,
+        overall=overall,
+        side=side,
+        order_type=order_type,
+        entry=float(entry) if entry is not None else None,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        tp3=tp3,
+        zone_name=zone_name,
+        zone_low=zone_low,
+        zone_high=zone_high,
+        fvg_items=fvg_items,
+        supports=supports,
+        resistances=resistances,
+        confidence=conf,
+        risk_usd=risk_usd,
     )
 
 
 # =========================
-# Main
+# Chart rendering (candles + EMAs)
+# =========================
+def plot_chart_m30(df30: pd.DataFrame, title: str) -> bytes:
+    d = df30.tail(120).copy()
+    d = d.reset_index()
+
+    # Convert index/time for labels
+    if "Datetime" in d.columns:
+        x = d["Datetime"]
+    elif "Date" in d.columns:
+        x = d["Date"]
+    else:
+        x = d.iloc[:, 0]
+
+    close = d["Close"]
+    e20 = ema(close, EMA_FAST)
+    e50 = ema(close, EMA_MID)
+    e200 = ema(close, EMA_SLOW) if len(close) > EMA_SLOW else None
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.set_title(title)
+
+    # Candles
+    for i in range(len(d)):
+        o = float(d.loc[i, "Open"])
+        h = float(d.loc[i, "High"])
+        l = float(d.loc[i, "Low"])
+        c = float(d.loc[i, "Close"])
+
+        # wick
+        ax.plot([i, i], [l, h], linewidth=1)
+
+        # body
+        body_low = min(o, c)
+        body_high = max(o, c)
+        height = max(1e-9, body_high - body_low)
+        rect = plt.Rectangle(
+            (i - 0.35, body_low),
+            0.7,
+            height,
+            fill=True,
+            alpha=0.6
+        )
+        ax.add_patch(rect)
+
+    # EMAs
+    ax.plot(range(len(d)), e20, linewidth=1.2, label=f"EMA{EMA_FAST}")
+    ax.plot(range(len(d)), e50, linewidth=1.2, label=f"EMA{EMA_MID}")
+    if e200 is not None:
+        ax.plot(range(len(d)), e200, linewidth=1.2, label=f"EMA{EMA_SLOW}")
+
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.2)
+    ax.set_xlim(0, len(d) - 1)
+
+    # x ticks sparse
+    step = max(1, len(d)//6)
+    ax.set_xticks(list(range(0, len(d), step)))
+    ax.set_xticklabels([str(x.iloc[i])[:16] for i in range(0, len(d), step)], rotation=0)
+
+    import io
+    buf = io.BytesIO()
+    plt.tight_layout()
+    fig.savefig(buf, format="png", dpi=160)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+# =========================
+# Message formatting (VIP)
+# =========================
+def fmt_num(x: Optional[float], digits: int = 2) -> str:
+    if x is None:
+        return "-"
+    return f"{x:.{digits}f}"
+
+def build_caption(sig: Signal) -> str:
+    risk_usd = sig.risk_usd
+    overall_text = f"{sig.trend_d1:+d} / {sig.trend_h4:+d}  => Overall: {sig.overall:+d}"
+
+    # أمر
+    if sig.side == "NONE" or sig.entry is None:
+        return (
+            f"<b>بوت الشبح VIP • M30</b>\n"
+            f"📌 <b>{sig.symbol_key}</b> ({sig.symbol_used})\n"
+            f"Trend D1/H4: {overall_text}\n"
+            f"Signal: ⚪ NONE\n"
+            f"Price: {fmt_num(sig.price, 2)}\n"
+        )
+
+    if sig.order_type == "MARKET":
+        order_line = "🟢 BUY (Market)" if sig.side == "BUY" else "🔴 SELL (Market)"
+        entry_line = f"Entry: {fmt_num(sig.entry, 2)}"
+    else:
+        order_line = "🟢 Buy Limit" if sig.side == "BUY" else "🔴 Sell Limit"
+        entry_line = f"{order_line}: {fmt_num(sig.entry, 2)}"
+
+    zone_line = "-"
+    if sig.zone_low is not None and sig.zone_high is not None:
+        zone_line = f"{sig.zone_name} [{fmt_num(sig.zone_low,2)} - {fmt_num(sig.zone_high,2)}]"
+
+    # FVG text
+    fvg_txt = ""
+    if sig.fvg_items:
+        lines = []
+        for k, a, b in sig.fvg_items:
+            lines.append(f"{k}: [{fmt_num(a,2)} - {fmt_num(b,2)}]")
+        fvg_txt = "\n".join(lines)
+    else:
+        fvg_txt = "-"
+
+    supports_txt = ", ".join(fmt_num(x, 2) for x in sig.supports) if sig.supports else "-"
+    res_txt = ", ".join(fmt_num(x, 2) for x in sig.resistances) if sig.resistances else "-"
+
+    return (
+        f"<b>🔥 نسخة M30 الاحترافية • VIP + Retest</b>\n\n"
+        f"📌 <b>{sig.symbol_key}</b> ({sig.symbol_used})\n"
+        f"Trend D1/H4: {overall_text}\n\n"
+        f"{entry_line}\n"
+        f"SL: {fmt_num(sig.sl, 2)}\n"
+        f"TP1: {fmt_num(sig.tp1, 2)}\n"
+        f"TP2: {fmt_num(sig.tp2, 2)}\n"
+        f"TP3: {fmt_num(sig.tp3, 2)}\n\n"
+        f"Zone: {zone_line}\n"
+        f"Supports: {supports_txt}\n"
+        f"Resistances: {res_txt}\n\n"
+        f"FVG:\n{fvg_txt}\n\n"
+        f"Risk: {RISK_PCT:.1f}% (~${risk_usd:.1f})\n"
+        f"Confidence: {sig.confidence}/10\n"
+    )
+
+
+# =========================
+# Cooldown control
+# =========================
+_last_sent: Dict[str, float] = {}
+
+def in_cooldown(key: str) -> bool:
+    if key not in _last_sent:
+        return False
+    return (time.time() - _last_sent[key]) < (COOLDOWN_MINUTES * 60)
+
+def mark_sent(key: str):
+    _last_sent[key] = time.time()
+
+
+# =========================
+# Main loop
 # =========================
 def main():
     if not BOT_TOKEN or not CHAT_ID:
-        logging.error("Missing BOT_TOKEN/CHAT_ID. Set them in Railway Variables.")
+        logging.error("Set BOT_TOKEN and CHAT_ID in Railway Variables.")
         return
 
-    state = load_state()
-    logging.info("VIP bot started.")
-
-    # Startup ping (optional)
-    try:
-        tg_send_text("✅ VIP M30+ started (Chart + EMAs + EMA Filter + Retest).")
-    except Exception as e:
-        logging.error("Startup message failed: %s", e)
-
+    logging.info("Bot started. Symbols: %s", list(SYMBOLS.keys()))
     while True:
         try:
-            for name, ticker in SYMBOLS.items():
-                sig = build_signal(name, ticker)
-                if not sig:
+            for k in SYMBOLS.keys():
+                if in_cooldown(k):
                     continue
 
-                # signature (avoid duplicates)
-                zone: Zone = sig["zone"]
-                signature = sha(
-                    f"{ticker}|{sig['direction']}|{sig['mode']}|{sig['entry']}|{sig['sl']}|{zone.name}|{round(zone.low,2)}|{round(zone.high,2)}"
-                )
-                key = f"{ticker}:{sig['direction']}"
-
-                if not cooldown_ok(state, key):
-                    continue
-                if already_sent_same(state, key, signature):
+                sig = build_signal(k)
+                if sig is None:
                     continue
 
-                # build chart + send photo (fallback text)
-                try:
-                    m30 = yf_fetch(ticker, TF_SIGNAL, PERIOD_SIGNAL)
-                    img = render_chart(m30, sig)
-                    cap = format_caption(sig)
-                    tg_send_photo(cap, img)
-                except Exception as e:
-                    logging.error("Send photo failed, fallback to text. Reason: %s", e)
-                    try:
-                        tg_send_text(format_caption(sig))
-                    except Exception as e2:
-                        logging.error("Fallback text failed too: %s", e2)
-                        raise
+                # chart from M30
+                df30, _ = get_best_df(SYMBOLS[k], period="60d", interval="30m")
+                if df30 is None or df30.empty:
+                    continue
 
-                mark_sent(state, key, signature)
-                save_state(state)
-                logging.info("Sent %s (%s)", name, sig["mode"])
-                time.sleep(1)
+                title = f"{k} ({sig.symbol_used}) • M30"
+                img = plot_chart_m30(df30, title=title)
+                caption = build_caption(sig)
+
+                ok = send_telegram_photo_with_caption(img, caption)
+                if ok:
+                    mark_sent(k)
+
+                time.sleep(2)  # حتى لا نضغط على Telegram
 
             time.sleep(CHECK_INTERVAL_SEC)
 
         except Exception as e:
-            logging.exception("Main loop error: %s", e)
-            time.sleep(10)
+            logging.error("Loop error: %s", e)
+            time.sleep(min(60, CHECK_INTERVAL_SEC))
 
 
 if __name__ == "__main__":
