@@ -3,11 +3,10 @@ import os
 import io
 import time
 import json
-import math
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 import requests
 import pandas as pd
@@ -36,7 +35,7 @@ COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 MODE = os.getenv("MODE", "vip_retest").strip().lower()
 
 # ATR / Zone params
-TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))          # لمس/قرب المنطقة
+TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))          # (محجوز) لمس/قرب المنطقة
 RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))                  # شرط قرب لإرسال limit في vip_retest
 MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))
 SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
@@ -45,7 +44,7 @@ MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 UPDATES_TIMEOUT = 30
 
-# EMA (للترند فقط)
+# EMA (للترند + للشارت)
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
@@ -57,9 +56,9 @@ LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "30d")
 # State persistence
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
 
-# Symbols (Yahoo Finance) - يمكنك تغييرها في الكود أو من /symbols فقط للعرض
+# Symbols (Yahoo Finance)
 SYMBOLS: Dict[str, str] = {
-    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),       # أو XAUUSD=X إذا GC=F يرفض
+    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),       # إذا GC=F يرفض أحيانًا: جرّب XAUUSD=X
     "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
     "US100": os.getenv("US100_SYMBOL", "NQ=F"),
     "US30": os.getenv("US30_SYMBOL", "^DJI"),
@@ -89,7 +88,9 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     try:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        d = os.path.dirname(STATE_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -149,7 +150,6 @@ def yf_download_safe(symbol: str, period: str, interval: str) -> Optional[pd.Dat
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
-            # flatten if needed
             df.columns = [c[0] for c in df.columns]
 
         needed = {"Open", "High", "Low", "Close"}
@@ -214,6 +214,7 @@ def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, f
             continue
 
         if direction == "BUY":
+            # Bullish impulse then last bearish candle = OB proxy
             if c[i] > o[i] and c[i] > h[i - 1] and c[i - 1] < o[i - 1]:
                 return float(l[i - 1]), float(h[i - 1])
         else:
@@ -289,36 +290,45 @@ def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, f
     else:
         return entry - 1*r, entry - 2*r, entry - 3*r
 
-def build_plan(label: str, symbol: str) -> Optional[Plan]:
+
+def build_plan_debug(label: str, symbol: str) -> Tuple[Optional[Plan], str]:
+    """
+    يرجع (plan, reason)
+    reason يوضح سبب عدم وجود إشارة
+    """
     d1 = yf_download_safe(symbol, LOOKBACK_D1, "1d")
+    if d1 is None:
+        return None, "DATA_FAIL_D1"
+
     h4 = yf_download_safe(symbol, LOOKBACK_H4, "4h")
+    if h4 is None:
+        return None, "DATA_FAIL_H4"
+
     m30 = yf_download_safe(symbol, LOOKBACK_M30, "30m")
-    if d1 is None or h4 is None or m30 is None:
-        return None
+    if m30 is None:
+        return None, "DATA_FAIL_M30"
 
     t_d1 = trend_score(d1)
     t_h4 = trend_score(h4)
     overall = t_d1 + t_h4
 
-    # Decide direction
     if overall >= 1:
         side = "BUY"
     elif overall <= -1:
         side = "SELL"
     else:
-        return None
+        return None, f"NO_TREND (D1={t_d1}, H4={t_h4})"
 
     px = last_price(m30)
     a = atr(m30, 14).iloc[-1]
     if a is None or pd.isna(a) or a <= 0:
-        return None
+        return None, "ATR_INVALID"
     a = float(a)
 
     # Volatility guard
     if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
-        return None
+        return None, f"ATR_TOO_HIGH ({a/abs(px):.4f} > {MAX_ATR_PCT})"
 
-    # zones priority
     direction = "BUY" if side == "BUY" else "SELL"
     ob = find_orderblock(m30, direction)
     fvg = find_fvg(m30, direction)
@@ -343,17 +353,20 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         dist_atr = abs(px - mid) / (a + 1e-9)
 
         if MODE == "vip_retest":
-            # send only if price is close enough to zone (retest)
+            # يرسل فقط عند retest قريب
             if dist_atr <= RETEST_ATR:
                 entry_type = "LIMIT"
                 entry = mid
             else:
-                return None
+                return None, f"TOO_FAR_FROM_ZONE dist_ATR={dist_atr:.2f} > RETEST_ATR={RETEST_ATR}"
         else:
-            # vip_mix allows pending if within max distance, else keep market
+            # vip_mix يسمح pending إذا قريب، وإلا Market
             if dist_atr <= MAX_PENDING_DISTANCE_ATR:
                 entry_type = "LIMIT"
                 entry = mid
+            else:
+                entry_type = "MARKET"
+                entry = px
 
     # SL beyond zone with buffer, else ATR based
     if side == "BUY":
@@ -378,7 +391,7 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
 
     risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
 
-    return Plan(
+    plan = Plan(
         label=label,
         symbol=symbol,
         timeframe="M30",
@@ -399,6 +412,12 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         confidence=conf,
         risk_usd=round(float(risk_usd), 2),
     )
+    return plan, "OK"
+
+
+def build_plan(label: str, symbol: str) -> Optional[Plan]:
+    plan, _ = build_plan_debug(label, symbol)
+    return plan
 
 
 # =========================
@@ -445,7 +464,6 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     ax.grid(True, alpha=0.2)
     ax.legend(loc="upper left", fontsize=9)
 
-    # x labels sparse
     idx = d.index
     step = max(1, len(d)//6)
     ticks = list(range(0, len(d), step))
@@ -490,7 +508,10 @@ def format_plan(plan: Plan) -> str:
     )
 
 def signal_hash(plan: Plan) -> str:
-    key = f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry:.2f}|{plan.sl:.2f}|{plan.tp1:.2f}|{plan.tp2:.2f}|{plan.tp3:.2f}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}"
+    key = (
+        f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry:.2f}|{plan.sl:.2f}|"
+        f"{plan.tp1:.2f}|{plan.tp2:.2f}|{plan.tp3:.2f}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}"
+    )
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 def should_send(state: dict, plan: Plan) -> bool:
@@ -502,11 +523,14 @@ def should_send(state: dict, plan: Plan) -> bool:
     h = signal_hash(plan)
     cooldown = COOLDOWN_MINUTES * 60
 
-    # block duplicates or any signal during cooldown
+    # منع أي إرسال لنفس الرمز خلال فترة التهدئة (يمنع تكرار نفس الدقيقة)
     if (now - last_ts) < cooldown:
         return False
+
+    # زيادة حماية (لو رجع نفس الهاش بعد التهدئة القصيرة)
     if h == last_hash and (now - last_ts) < cooldown:
         return False
+
     return True
 
 def mark_sent(state: dict, plan: Plan) -> None:
@@ -521,6 +545,7 @@ HELP_TEXT = (
     "/help\n"
     "/status\n"
     "/symbols\n"
+    "/why  (أسباب عدم ظهور إشارات)\n"
     "/mode vip_retest  أو  /mode vip_mix\n"
     "/analyze XAU  (أو BTC / US100 / US30 / OIL)\n"
     "/scan  (أفضل إشارة)\n"
@@ -558,6 +583,17 @@ def handle_command(state: dict, update: dict) -> None:
         tg_send_message(chat_id, "Symbols: " + ", ".join([f"{k}={v}" for k, v in SYMBOLS.items()]))
         return
 
+    if cmd == "/why":
+        lines = ["🧠 WHY (Debug Reasons):"]
+        for k, sym in SYMBOLS.items():
+            p, reason = build_plan_debug(k, sym)
+            if p is not None:
+                lines.append(f"✅ {k} ({sym}) => OK | {p.side} {p.entry_type} @ {p.entry}")
+            else:
+                lines.append(f"❌ {k} ({sym}) => {reason}")
+        tg_send_message(chat_id, "\n".join(lines)[:4000])
+        return
+
     if cmd == "/mode" and len(parts) >= 2:
         m = parts[1].strip().lower()
         if m in ("vip_retest", "vip_mix"):
@@ -585,9 +621,9 @@ def handle_command(state: dict, update: dict) -> None:
             tg_send_message(chat_id, "❌ الرمز غير معروف. جرّب /symbols")
             return
 
-        plan = build_plan(sym_key, SYMBOLS[sym_key])
+        plan, reason = build_plan_debug(sym_key, SYMBOLS[sym_key])
         if plan is None:
-            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key} حسب شروط VIP.")
+            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key} حسب شروط VIP.\nReason: {reason}")
             return
 
         m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
@@ -605,7 +641,7 @@ def handle_command(state: dict, update: dict) -> None:
     if cmd == "/scan":
         best = None
         for k, sym in SYMBOLS.items():
-            p = build_plan(k, sym)
+            p, _r = build_plan_debug(k, sym)
             if p is None:
                 continue
             if best is None or p.confidence > best.confidence:
@@ -667,8 +703,9 @@ def main():
             last_check = now
 
             for label, sym in SYMBOLS.items():
-                plan = build_plan(label, sym)
+                plan, reason = build_plan_debug(label, sym)
                 if plan is None:
+                    logging.info("NO SIGNAL for %s (%s): %s", label, sym, reason)
                     continue
 
                 if not should_send(state, plan):
@@ -676,6 +713,7 @@ def main():
 
                 m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
                 if m30 is None or m30.empty:
+                    logging.info("CHART DATA FAIL for %s (%s) M30", label, plan.symbol)
                     continue
 
                 caption = format_plan(plan)
