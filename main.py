@@ -3,10 +3,11 @@ import os
 import io
 import time
 import json
+import math
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import requests
 import pandas as pd
@@ -15,6 +16,16 @@ import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+
+# =========================
+# LOGGING (Railway-friendly)
+# =========================
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+logger = logging.getLogger("vip_bot")
 
 
 # =========================
@@ -31,11 +42,11 @@ COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
 # MODE:
 # vip_retest: يرسل فقط إذا السعر قريب/لمس Zone (أكثر دقة وأقل سبام)
-# vip_mix: يسمح بإرسال Pending إذا كانت داخل MAX_PENDING_DISTANCE_ATR
+# vip_mix: يسمح بإرسال Pending حتى لو بعيدة قليلاً (حتى MAX_PENDING_DISTANCE_ATR)
 MODE = os.getenv("MODE", "vip_retest").strip().lower()
 
 # ATR / Zone params
-TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))          # (محجوز) لمس/قرب المنطقة
+TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))          # لمس/قرب المنطقة
 RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))                  # شرط قرب لإرسال limit في vip_retest
 MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))
 SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
@@ -44,7 +55,7 @@ MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 UPDATES_TIMEOUT = 30
 
-# EMA (للترند + للشارت)
+# EMA (للترند + الرسم)
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
@@ -54,11 +65,12 @@ LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "120d")
 LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "30d")
 
 # State persistence
-STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
+# جرّب اجعلها "state.json" بدل /tmp إذا لاحظت تكرار بسبب restart
+STATE_PATH = os.getenv("STATE_PATH", "state.json")
 
 # Symbols (Yahoo Finance)
 SYMBOLS: Dict[str, str] = {
-    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),       # إذا GC=F يرفض أحيانًا: جرّب XAUUSD=X
+    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),       # بديل محتمل: XAUUSD=X
     "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
     "US100": os.getenv("US100_SYMBOL", "NQ=F"),
     "US30": os.getenv("US30_SYMBOL", "^DJI"),
@@ -66,8 +78,6 @@ SYMBOLS: Dict[str, str] = {
 }
 
 TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 
 # =========================
@@ -78,23 +88,22 @@ def load_state() -> dict:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load state: %s", e)
+
     return {
-        "last_sent": {},    # symbol -> {ts, hash}
+        "last_sent": {},      # symbol -> {ts, hash}
+        "last_global": {},    # hash -> ts
         "tg_offset": 0,
         "paused": False,
     }
 
 def save_state(state: dict) -> None:
     try:
-        d = os.path.dirname(STATE_PATH)
-        if d:
-            os.makedirs(d, exist_ok=True)
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.warning("Failed to save state: %s", e)
+        logger.warning("Failed to save state: %s", e)
 
 
 # =========================
@@ -103,40 +112,51 @@ def save_state(state: dict) -> None:
 def tg_url(method: str) -> str:
     return TELEGRAM_BASE.format(token=BOT_TOKEN, method=method)
 
+def tg_delete_webhook() -> None:
+    """مهم جداً: إذا كان Webhook مفعّل فلن يعمل getUpdates وبالتالي البوت لن يرد على الأوامر."""
+    try:
+        r = requests.get(tg_url("deleteWebhook"), params={"drop_pending_updates": True}, timeout=REQUEST_TIMEOUT)
+        if not r.ok:
+            logger.warning("deleteWebhook failed: %s | %s", r.status_code, r.text[:200])
+        else:
+            logger.info("deleteWebhook OK")
+    except Exception as e:
+        logger.warning("deleteWebhook error: %s", e)
+
 def tg_send_message(chat_id: str, text: str) -> bool:
     try:
         payload = {"chat_id": chat_id, "text": text[:4096], "disable_web_page_preview": True}
         r = requests.post(tg_url("sendMessage"), json=payload, timeout=REQUEST_TIMEOUT)
         if not r.ok:
-            logging.error("sendMessage failed: %s | %s", r.status_code, r.text[:300])
+            logger.error("sendMessage failed: %s | %s", r.status_code, r.text[:300])
             return False
         return True
     except Exception as e:
-        logging.error("sendMessage error: %s", e)
+        logger.error("sendMessage error: %s", e)
         return False
 
 def tg_send_photo(chat_id: str, caption: str, image_bytes: bytes) -> bool:
     try:
-        caption = (caption or "")[:1000]  # safe under 1024 caption limit
+        caption = (caption or "")[:900]  # safe under caption limit
         files = {"photo": ("chart.png", image_bytes, "image/png")}
         data = {"chat_id": chat_id, "caption": caption}
         r = requests.post(tg_url("sendPhoto"), data=data, files=files, timeout=REQUEST_TIMEOUT)
         if not r.ok:
-            logging.error("sendPhoto failed: %s | %s", r.status_code, r.text[:300])
+            logger.error("sendPhoto failed: %s | %s", r.status_code, r.text[:300])
             return False
         return True
     except Exception as e:
-        logging.error("sendPhoto error: %s", e)
+        logger.error("sendPhoto error: %s", e)
         return False
 
 def tg_get_updates(offset: int) -> dict:
     try:
-        params = {"timeout": UPDATES_TIMEOUT, "offset": offset}
+        params = {"timeout": UPDATES_TIMEOUT, "offset": offset, "allowed_updates": ["message", "channel_post"]}
         r = requests.get(tg_url("getUpdates"), params=params, timeout=UPDATES_TIMEOUT + 10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        logging.error("getUpdates error: %s", e)
+        logger.error("getUpdates error: %s", e)
         return {"ok": False, "result": []}
 
 
@@ -149,6 +169,7 @@ def yf_download_safe(symbol: str, period: str, interval: str) -> Optional[pd.Dat
         if df is None or df.empty:
             return None
 
+        # flatten if needed
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
 
@@ -161,7 +182,7 @@ def yf_download_safe(symbol: str, period: str, interval: str) -> Optional[pd.Dat
             return None
         return df
     except Exception as e:
-        logging.error("yfinance failed %s %s %s: %s", symbol, period, interval, e)
+        logger.error("yfinance failed %s %s %s: %s", symbol, period, interval, e)
         return None
 
 def ema(series: pd.Series, n: int) -> pd.Series:
@@ -214,7 +235,6 @@ def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, f
             continue
 
         if direction == "BUY":
-            # Bullish impulse then last bearish candle = OB proxy
             if c[i] > o[i] and c[i] > h[i - 1] and c[i - 1] < o[i - 1]:
                 return float(l[i - 1]), float(h[i - 1])
         else:
@@ -281,6 +301,8 @@ class Plan:
     atr_value: float
     confidence: int
     risk_usd: float
+    # extra: pending suggestions (بعيدة/معلقة)
+    pending_entries: Optional[List[float]] = None
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
     r = abs(entry - sl)
@@ -290,44 +312,34 @@ def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, f
     else:
         return entry - 1*r, entry - 2*r, entry - 3*r
 
-
-def build_plan_debug(label: str, symbol: str) -> Tuple[Optional[Plan], str]:
-    """
-    يرجع (plan, reason)
-    reason يوضح سبب عدم وجود إشارة
-    """
+def build_plan(label: str, symbol: str) -> Optional[Plan]:
     d1 = yf_download_safe(symbol, LOOKBACK_D1, "1d")
-    if d1 is None:
-        return None, "DATA_FAIL_D1"
-
     h4 = yf_download_safe(symbol, LOOKBACK_H4, "4h")
-    if h4 is None:
-        return None, "DATA_FAIL_H4"
-
     m30 = yf_download_safe(symbol, LOOKBACK_M30, "30m")
-    if m30 is None:
-        return None, "DATA_FAIL_M30"
+    if d1 is None or h4 is None or m30 is None:
+        return None
 
     t_d1 = trend_score(d1)
     t_h4 = trend_score(h4)
     overall = t_d1 + t_h4
 
+    # Decide direction
     if overall >= 1:
         side = "BUY"
     elif overall <= -1:
         side = "SELL"
     else:
-        return None, f"NO_TREND (D1={t_d1}, H4={t_h4})"
+        return None
 
     px = last_price(m30)
     a = atr(m30, 14).iloc[-1]
     if a is None or pd.isna(a) or a <= 0:
-        return None, "ATR_INVALID"
+        return None
     a = float(a)
 
     # Volatility guard
     if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
-        return None, f"ATR_TOO_HIGH ({a/abs(px):.4f} > {MAX_ATR_PCT})"
+        return None
 
     direction = "BUY" if side == "BUY" else "SELL"
     ob = find_orderblock(m30, direction)
@@ -346,6 +358,7 @@ def build_plan_debug(label: str, symbol: str) -> Tuple[Optional[Plan], str]:
     entry = px
     zone_low = None
     zone_high = None
+    pending_entries: List[float] = []
 
     if zone:
         zone_low, zone_high = float(min(zone[0], zone[1])), float(max(zone[0], zone[1]))
@@ -353,20 +366,31 @@ def build_plan_debug(label: str, symbol: str) -> Tuple[Optional[Plan], str]:
         dist_atr = abs(px - mid) / (a + 1e-9)
 
         if MODE == "vip_retest":
-            # يرسل فقط عند retest قريب
+            # send only if price is close enough to zone (retest)
             if dist_atr <= RETEST_ATR:
                 entry_type = "LIMIT"
                 entry = mid
             else:
-                return None, f"TOO_FAR_FROM_ZONE dist_ATR={dist_atr:.2f} > RETEST_ATR={RETEST_ATR}"
+                return None
+
         else:
-            # vip_mix يسمح pending إذا قريب، وإلا Market
-            if dist_atr <= MAX_PENDING_DISTANCE_ATR:
+            # vip_mix:
+            # 1) إذا قريب: LIMIT على منتصف المنطقة
+            # 2) إذا بعيد لكن داخل MAX_PENDING_DISTANCE_ATR: نرسل "أوامر معلقة بعيدة" (2 مستويات)
+            if dist_atr <= RETEST_ATR:
                 entry_type = "LIMIT"
                 entry = mid
+            elif dist_atr <= MAX_PENDING_DISTANCE_ATR:
+                entry_type = "MARKET"  # نرسل كإشارة عامة + نضيف pending مقترحة
+                # pending 2 levels: mid + edge
+                pending_entries = [mid]
+                if side == "BUY":
+                    pending_entries.append(zone_low)
+                else:
+                    pending_entries.append(zone_high)
             else:
-                entry_type = "MARKET"
-                entry = px
+                # بعيد جداً
+                return None
 
     # SL beyond zone with buffer, else ATR based
     if side == "BUY":
@@ -382,16 +406,16 @@ def build_plan_debug(label: str, symbol: str) -> Tuple[Optional[Plan], str]:
 
     tp1, tp2, tp3 = calc_rr_targets(entry, sl, side)
 
-    # confidence (simple)
     conf = 5
     conf += 2 if abs(overall) == 2 else 1
-    conf += 2 if entry_type == "LIMIT" and zone_name in ("OrderBlock", "FVG") else 0
+    conf += 2 if (zone_name in ("OrderBlock", "FVG")) else 0
+    conf += 1 if entry_type == "LIMIT" else 0
     conf -= 1 if (a / (abs(px) + 1e-9)) > (0.8 * MAX_ATR_PCT) else 0
     conf = int(max(1, min(10, conf)))
 
     risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
 
-    plan = Plan(
+    return Plan(
         label=label,
         symbol=symbol,
         timeframe="M30",
@@ -411,17 +435,12 @@ def build_plan_debug(label: str, symbol: str) -> Tuple[Optional[Plan], str]:
         atr_value=float(a),
         confidence=conf,
         risk_usd=round(float(risk_usd), 2),
+        pending_entries=[round(x, 2) for x in pending_entries] if pending_entries else None
     )
-    return plan, "OK"
-
-
-def build_plan(label: str, symbol: str) -> Optional[Plan]:
-    plan, _ = build_plan_debug(label, symbol)
-    return plan
 
 
 # =========================
-# CHART IMAGE
+# CHART IMAGE (Candles + EMAs)
 # =========================
 def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     d = df.tail(120).copy()
@@ -442,7 +461,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
         ax.plot([x[i], x[i]], [l[i], h[i]], linewidth=1)
         y0 = min(o[i], c[i])
         y1 = max(o[i], c[i])
-        rect = plt.Rectangle((x[i]-0.35, y0), 0.7, max(y1 - y0, 1e-9), fill=False, linewidth=1)
+        rect = plt.Rectangle((x[i] - 0.35, y0), 0.7, max(y1 - y0, 1e-9), fill=False, linewidth=1)
         ax.add_patch(rect)
 
     # EMAs
@@ -451,10 +470,10 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
 
     # zone shading
     if plan.zone_low is not None and plan.zone_high is not None:
-        ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.15)
+        ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.18)
 
     # levels
-    ax.axhline(plan.entry, linewidth=1.2)
+    ax.axhline(plan.entry, linewidth=1.3)
     ax.axhline(plan.sl, linewidth=1.2)
     ax.axhline(plan.tp1, linewidth=1.0)
     ax.axhline(plan.tp2, linewidth=1.0)
@@ -465,7 +484,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     ax.legend(loc="upper left", fontsize=9)
 
     idx = d.index
-    step = max(1, len(d)//6)
+    step = max(1, len(d) // 6)
     ticks = list(range(0, len(d), step))
     ax.set_xticks(ticks)
     ax.set_xticklabels([str(idx[i])[:16] for i in ticks], rotation=15, ha="right", fontsize=8)
@@ -482,7 +501,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
 # FORMAT + DEDUP
 # =========================
 def format_plan(plan: Plan) -> str:
-    side_emoji = "🔵" if plan.side == "BUY" else "🔴"
+    side_emoji = "🟢" if plan.side == "BUY" else "🔴"
     if plan.entry_type == "LIMIT":
         order = "Buy Limit" if plan.side == "BUY" else "Sell Limit"
     else:
@@ -491,6 +510,17 @@ def format_plan(plan: Plan) -> str:
     zone_txt = "—"
     if plan.zone_low is not None and plan.zone_high is not None:
         zone_txt = f"{plan.zone_name} [{plan.zone_low:.2f} - {plan.zone_high:.2f}]"
+
+    pending_txt = ""
+    if plan.pending_entries:
+        p_lines = []
+        if plan.side == "BUY":
+            for i, p in enumerate(plan.pending_entries, start=1):
+                p_lines.append(f"• Buy Limit #{i}: {p:.2f}")
+        else:
+            for i, p in enumerate(plan.pending_entries, start=1):
+                p_lines.append(f"• Sell Limit #{i}: {p:.2f}")
+        pending_txt = "\n\n📌 Pending (بعيدة):\n" + "\n".join(p_lines)
 
     return (
         f"🔥 VIP M30\n"
@@ -505,36 +535,49 @@ def format_plan(plan: Plan) -> str:
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
         f"Confidence: {plan.confidence}/10\n"
         f"Mode: {MODE}\n"
+        f"{pending_txt}"
     )
 
 def signal_hash(plan: Plan) -> str:
     key = (
-        f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry:.2f}|{plan.sl:.2f}|"
-        f"{plan.tp1:.2f}|{plan.tp2:.2f}|{plan.tp3:.2f}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}"
+        f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry:.2f}|"
+        f"{plan.sl:.2f}|{plan.tp1:.2f}|{plan.tp2:.2f}|{plan.tp3:.2f}|"
+        f"{plan.zone_name}|{plan.zone_low}|{plan.zone_high}|{plan.pending_entries}"
     )
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 def should_send(state: dict, plan: Plan) -> bool:
     now = time.time()
-    rec = state.get("last_sent", {}).get(plan.symbol, {})
-    last_ts = float(rec.get("ts", 0))
-    last_hash = rec.get("hash", "")
-
-    h = signal_hash(plan)
     cooldown = COOLDOWN_MINUTES * 60
 
-    # منع أي إرسال لنفس الرمز خلال فترة التهدئة (يمنع تكرار نفس الدقيقة)
-    if (now - last_ts) < cooldown:
+    h = signal_hash(plan)
+
+    # 1) Global anti-duplicate (حتى لو restart)
+    last_global = state.get("last_global", {})
+    ts_g = float(last_global.get(h, 0))
+    if (now - ts_g) < cooldown:
         return False
 
-    # زيادة حماية (لو رجع نفس الهاش بعد التهدئة القصيرة)
-    if h == last_hash and (now - last_ts) < cooldown:
+    # 2) Per-symbol cooldown
+    rec = state.get("last_sent", {}).get(plan.symbol, {})
+    last_ts = float(rec.get("ts", 0))
+    if (now - last_ts) < cooldown:
         return False
 
     return True
 
 def mark_sent(state: dict, plan: Plan) -> None:
-    state.setdefault("last_sent", {})[plan.symbol] = {"ts": time.time(), "hash": signal_hash(plan)}
+    now = time.time()
+    h = signal_hash(plan)
+    state.setdefault("last_sent", {})[plan.symbol] = {"ts": now, "hash": h}
+    state.setdefault("last_global", {})[h] = now
+
+    # تنظيف hashes القديمة حتى لا يكبر الملف
+    ttl = max(3600, COOLDOWN_MINUTES * 60 * 4)
+    lg = state.get("last_global", {})
+    for k in list(lg.keys()):
+        if (now - float(lg.get(k, 0))) > ttl:
+            lg.pop(k, None)
 
 
 # =========================
@@ -545,28 +588,68 @@ HELP_TEXT = (
     "/help\n"
     "/status\n"
     "/symbols\n"
-    "/why  (أسباب عدم ظهور إشارات)\n"
     "/mode vip_retest  أو  /mode vip_mix\n"
     "/analyze XAU  (أو BTC / US100 / US30 / OIL)\n"
     "/scan  (أفضل إشارة)\n"
-    "/pause  |  /resume\n"
+    "/pause  |  /resume\n\n"
+    "ملاحظة: داخل المجموعات أحياناً تحتاج:\n"
+    "/help@اسم_البوت\n"
 )
+
+def _normalize_symbol_text(txt: str) -> Optional[str]:
+    t = (txt or "").strip().upper()
+    if not t:
+        return None
+    # aliases
+    aliases = {
+        "GOLD": "XAU",
+        "XAUUSD": "XAU",
+        "XAU/USD": "XAU",
+        "NAS100": "US100",
+        "NQ": "US100",
+        "US-100": "US100",
+        "DOW": "US30",
+        "DJI": "US30",
+        "US-30": "US30",
+        "WTI": "OIL",
+        "OIL": "OIL",
+    }
+    return aliases.get(t, t)
+
+def _strip_botname(cmd: str) -> str:
+    # /help@mybot -> /help
+    if "@" in cmd:
+        return cmd.split("@", 1)[0]
+    return cmd
 
 def handle_command(state: dict, update: dict) -> None:
     msg = update.get("message") or update.get("channel_post") or {}
     text = (msg.get("text") or "").strip()
-    if not text.startswith("/"):
+    if not text:
         return
 
     chat = msg.get("chat", {})
-    chat_id = str(chat.get("id", "")) or CHAT_ID  # يرد في نفس الكروب
+    chat_id = str(chat.get("id", "")) if chat.get("id") is not None else ""
+    if not chat_id:
+        return
+
+    # إذا تريد تقييد الأوامر فقط على نفس CHAT_ID:
+    # اجعل ALLOW_ANY_CHAT=0
+    allow_any = os.getenv("ALLOW_ANY_CHAT", "1").strip() == "1"
+    if (not allow_any) and CHAT_ID and (chat_id != CHAT_ID) and (str(chat.get("username", "")) != CHAT_ID.lstrip("@")):
+        return
+
+    # أوامر تبدأ بـ /
+    if not text.startswith("/"):
+        return
 
     parts = text.split()
-    cmd = parts[0].lower()
+    cmd_raw = parts[0].lower()
+    cmd = _strip_botname(cmd_raw)
 
     global MODE
 
-    if cmd == "/help":
+    if cmd in ("/help", "/halp"):  # دعم خطأ كتابي شائع
         tg_send_message(chat_id, HELP_TEXT)
         return
 
@@ -574,24 +657,13 @@ def handle_command(state: dict, update: dict) -> None:
         tg_send_message(
             chat_id,
             f"MODE={MODE}\nCHECK_INTERVAL_SEC={CHECK_INTERVAL_SEC}\nCOOLDOWN_MINUTES={COOLDOWN_MINUTES}\n"
-            f"TOUCH_ATR_MULT={TOUCH_ATR_MULT}\nRETEST_ATR={RETEST_ATR}\nMAX_PENDING_DISTANCE_ATR={MAX_PENDING_DISTANCE_ATR}\n"
+            f"RETEST_ATR={RETEST_ATR}\nMAX_PENDING_DISTANCE_ATR={MAX_PENDING_DISTANCE_ATR}\n"
             f"SL_BUFFER_ATR={SL_BUFFER_ATR}\nMAX_ATR_PCT={MAX_ATR_PCT}\nRISK_PCT={RISK_PCT}\nPAUSED={state.get('paused', False)}"
         )
         return
 
     if cmd == "/symbols":
         tg_send_message(chat_id, "Symbols: " + ", ".join([f"{k}={v}" for k, v in SYMBOLS.items()]))
-        return
-
-    if cmd == "/why":
-        lines = ["🧠 WHY (Debug Reasons):"]
-        for k, sym in SYMBOLS.items():
-            p, reason = build_plan_debug(k, sym)
-            if p is not None:
-                lines.append(f"✅ {k} ({sym}) => OK | {p.side} {p.entry_type} @ {p.entry}")
-            else:
-                lines.append(f"❌ {k} ({sym}) => {reason}")
-        tg_send_message(chat_id, "\n".join(lines)[:4000])
         return
 
     if cmd == "/mode" and len(parts) >= 2:
@@ -615,15 +687,23 @@ def handle_command(state: dict, update: dict) -> None:
         tg_send_message(chat_id, "▶️ تم تشغيل الإشارات التلقائية.")
         return
 
-    if cmd == "/analyze" and len(parts) >= 2:
-        sym_key = parts[1].upper().strip()
+    # analyze + aliases shortcuts: /xau /btc /us100 ...
+    if cmd in ("/analyze", "/xau", "/btc", "/us100", "/us30", "/oil", "/xauusd"):
+        if cmd != "/analyze":
+            sym_key = _normalize_symbol_text(cmd.replace("/", ""))
+        else:
+            if len(parts) < 2:
+                tg_send_message(chat_id, "اكتب مثال: /analyze XAU")
+                return
+            sym_key = _normalize_symbol_text(parts[1])
+
         if sym_key not in SYMBOLS:
             tg_send_message(chat_id, "❌ الرمز غير معروف. جرّب /symbols")
             return
 
-        plan, reason = build_plan_debug(sym_key, SYMBOLS[sym_key])
+        plan = build_plan(sym_key, SYMBOLS[sym_key])
         if plan is None:
-            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key} حسب شروط VIP.\nReason: {reason}")
+            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key} حسب شروط VIP.")
             return
 
         m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
@@ -633,7 +713,6 @@ def handle_command(state: dict, update: dict) -> None:
 
         caption = format_plan(plan)
         img = render_chart(m30, plan)
-
         if not tg_send_photo(chat_id, caption, img):
             tg_send_message(chat_id, caption)
         return
@@ -641,7 +720,7 @@ def handle_command(state: dict, update: dict) -> None:
     if cmd == "/scan":
         best = None
         for k, sym in SYMBOLS.items():
-            p, _r = build_plan_debug(k, sym)
+            p = build_plan(k, sym)
             if p is None:
                 continue
             if best is None or p.confidence > best.confidence:
@@ -658,7 +737,6 @@ def handle_command(state: dict, update: dict) -> None:
 
         caption = "🔥 BEST VIP SIGNAL\n\n" + format_plan(best)
         img = render_chart(m30, best)
-
         if not tg_send_photo(chat_id, caption, img):
             tg_send_message(chat_id, caption)
         return
@@ -669,11 +747,14 @@ def handle_command(state: dict, update: dict) -> None:
 # =========================
 def main():
     if not BOT_TOKEN or not CHAT_ID:
-        logging.error("Missing BOT_TOKEN or CHAT_ID in Railway Variables.")
+        logger.error("Missing BOT_TOKEN or CHAT_ID in Railway Variables.")
         return
 
+    # مهم للأوامر:
+    tg_delete_webhook()
+
     state = load_state()
-    logging.info("VIP bot started. MODE=%s", MODE)
+    logger.info("VIP bot started. MODE=%s | CHAT_ID=%s", MODE, CHAT_ID)
 
     # Startup message
     tg_send_message(CHAT_ID, "✅ VIP Bot Online (M30 + Chart + Auto + Commands). اكتب /help")
@@ -703,9 +784,8 @@ def main():
             last_check = now
 
             for label, sym in SYMBOLS.items():
-                plan, reason = build_plan_debug(label, sym)
+                plan = build_plan(label, sym)
                 if plan is None:
-                    logging.info("NO SIGNAL for %s (%s): %s", label, sym, reason)
                     continue
 
                 if not should_send(state, plan):
@@ -713,7 +793,6 @@ def main():
 
                 m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
                 if m30 is None or m30.empty:
-                    logging.info("CHART DATA FAIL for %s (%s) M30", label, plan.symbol)
                     continue
 
                 caption = format_plan(plan)
@@ -728,7 +807,7 @@ def main():
                 time.sleep(1)  # avoid Telegram burst
 
         except Exception as e:
-            logging.exception("Main loop error: %s", e)
+            logger.exception("Main loop error: %s", e)
             time.sleep(5)
 
 
