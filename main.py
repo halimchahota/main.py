@@ -68,8 +68,13 @@ USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
 MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "7"))  # فلتر /scan (لتقليل السبام)
 
+# Daily report (UTC)
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))      # UTC hour
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))  # UTC minute
+
+
 # =========================
-# SYMBOLS (20 Assets)
+# SYMBOLS (Assets)
 # =========================
 SYMBOLS: Dict[str, str] = {
     # --- FX (Yahoo: =X) ---
@@ -87,6 +92,10 @@ SYMBOLS: Dict[str, str] = {
     "SPX":   os.getenv("SPX_SYMBOL", "^GSPC"),      # S&P 500
     "DAX":   os.getenv("DAX_SYMBOL", "^GDAXI"),     # DAX
     "HK50":  os.getenv("HK50_SYMBOL", "^HSI"),      # Hang Seng
+
+    # ✅ Requested additions (cash names)
+    "GER40CASH": os.getenv("GER40CASH_SYMBOL", "^GDAXI"),
+    "BRENTCASH": os.getenv("BRENTCASH_SYMBOL", "BZ=F"),
 
     # --- Commodities ---
     "XAU":    os.getenv("XAU_SYMBOL", "GC=F"),      # Gold
@@ -118,11 +127,9 @@ def price_decimals(label: str, px: float) -> int:
     if label in fx_5:
         return 5
 
-    # crypto / indices / commodities
     if label in ("BTC", "ETH", "SOL"):
         return 2
 
-    # fallback: large price => 2 decimals, else 5
     return 2 if abs(px) >= 100 else 5
 
 
@@ -134,18 +141,34 @@ def fmt_price(label: str, x: float, px_hint: float) -> str:
 # =========================
 # STATE
 # =========================
+def _utc_date_str(ts: Optional[float] = None) -> str:
+    ts = ts if ts is not None else time.time()
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
 def load_state() -> dict:
     try:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                st = json.load(f)
+                # ensure keys exist
+                st.setdefault("last_sent", {})
+                st.setdefault("tg_offset", 0)
+                st.setdefault("paused", False)
+                st.setdefault("open_trades", {})
+                st.setdefault("daily", {})
+                st.setdefault("last_report_date", "")
+                return st
     except Exception as e:
         logger.warning("Failed to load state: %s", e)
 
     return {
-        "last_sent": {},    # symbol -> {ts, hash}
+        "last_sent": {},       # symbol -> {ts, hash}
         "tg_offset": 0,
         "paused": False,
+        "open_trades": {},     # trade_id -> trade dict
+        "daily": {},           # date -> stats
+        "last_report_date": "",# YYYY-MM-DD
     }
 
 
@@ -506,7 +529,7 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     else:
         sl = (zone_high + (SL_BUFFER_ATR * a)) if zone_high is not None else (entry + 1.5 * a)
 
-    # Guard: لا تسمح SL=Entry (خصوصاً فوركس)
+    # Guard: لا تسمح SL=Entry
     min_r = 0.25 * a
     if abs(entry - sl) < min_r:
         sl = (entry - 1.5 * a) if side == "BUY" else (entry + 1.5 * a)
@@ -608,6 +631,178 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
 
 
 # =========================
+# DAILY PERFORMANCE (approx via Yahoo M30)
+# =========================
+def _hit_in_bar(high_: float, low_: float, level: float) -> bool:
+    return low_ <= level <= high_
+
+
+def register_trade_for_daily(state: dict, plan: Plan) -> str:
+    tid = hashlib.sha1(f"{plan.symbol}|{plan.side}|{plan.entry}|{time.time()}".encode("utf-8")).hexdigest()[:18]
+    now = time.time()
+
+    state.setdefault("open_trades", {})[tid] = {
+        "id": tid,
+        "date": _utc_date_str(now),
+        "ts": now,
+        "symbol": plan.symbol,
+        "label": plan.label,
+        "side": plan.side,
+        "entry": float(plan.entry),
+        "sl": float(plan.sl),
+        "tp1": float(plan.tp1),
+        "tp2": float(plan.tp2),
+        "tp3": float(plan.tp3),
+        "status": "OPEN",  # OPEN / SL / TP1 / TP2 / TP3
+    }
+
+    day = _utc_date_str(now)
+    daily = state.setdefault("daily", {}).setdefault(day, {
+        "signals": 0,
+        "avg_conf_sum": 0,
+        "avg_conf_n": 0,
+        "wins": 0,
+        "losses": 0,
+        "tp1": 0,
+        "tp2": 0,
+        "tp3": 0,
+        "open": 0,
+    })
+    daily["signals"] += 1
+    daily["avg_conf_sum"] += int(plan.confidence)
+    daily["avg_conf_n"] += 1
+    daily["open"] += 1
+    return tid
+
+
+def update_trade_outcomes(state: dict) -> None:
+    open_trades = state.get("open_trades", {})
+    if not open_trades:
+        return
+
+    for tid, tr in list(open_trades.items()):
+        if tr.get("status") != "OPEN":
+            continue
+
+        symbol = tr.get("symbol")
+        if not symbol:
+            continue
+
+        df = yf_download_safe(symbol, "5d", "30m")
+        if df is None or df.empty:
+            continue
+
+        ts = float(tr.get("ts", 0))
+        if isinstance(df.index, pd.DatetimeIndex):
+            epoch = (df.index.astype("int64") // 10**9).astype("int64")
+            df2 = df.copy()
+            df2["_epoch"] = epoch
+            df2 = df2[df2["_epoch"] >= int(ts)]
+        else:
+            df2 = df
+
+        if df2.empty:
+            continue
+
+        side = tr.get("side", "BUY")
+        sl = float(tr.get("sl", 0))
+        tp1 = float(tr.get("tp1", 0))
+        tp2 = float(tr.get("tp2", 0))
+        tp3 = float(tr.get("tp3", 0))
+
+        resolved = None
+
+        # Conservative: إذا SL و TP في نفس الشمعة => نحسب SL
+        for _, row in df2.iterrows():
+            hi = float(row["High"])
+            lo = float(row["Low"])
+
+            sl_hit = _hit_in_bar(hi, lo, sl)
+            tp1_hit = _hit_in_bar(hi, lo, tp1)
+            tp2_hit = _hit_in_bar(hi, lo, tp2)
+            tp3_hit = _hit_in_bar(hi, lo, tp3)
+
+            if sl_hit:
+                resolved = "SL"
+                break
+            if tp3_hit:
+                resolved = "TP3"
+                break
+            if tp2_hit:
+                resolved = "TP2"
+                break
+            if tp1_hit:
+                resolved = "TP1"
+                break
+
+        if resolved:
+            tr["status"] = resolved
+            day = tr.get("date") or _utc_date_str(ts)
+            daily = state.setdefault("daily", {}).setdefault(day, {
+                "signals": 0,
+                "avg_conf_sum": 0,
+                "avg_conf_n": 0,
+                "wins": 0,
+                "losses": 0,
+                "tp1": 0,
+                "tp2": 0,
+                "tp3": 0,
+                "open": 0,
+            })
+
+            daily["open"] = max(0, int(daily.get("open", 0)) - 1)
+
+            if resolved == "SL":
+                daily["losses"] += 1
+            else:
+                daily["wins"] += 1
+                if resolved == "TP1":
+                    daily["tp1"] += 1
+                elif resolved == "TP2":
+                    daily["tp2"] += 1
+                elif resolved == "TP3":
+                    daily["tp3"] += 1
+
+
+def format_daily_report(state: dict, day: Optional[str] = None) -> str:
+    day = day or _utc_date_str()
+    d = state.get("daily", {}).get(day)
+
+    if not d:
+        return f"📊 الحصيلة اليومية {day} (UTC)\nلا توجد إشارات مسجلة اليوم."
+
+    avg_conf = (float(d.get("avg_conf_sum", 0)) / float(d.get("avg_conf_n", 1))) if d.get("avg_conf_n", 0) else 0.0
+    wins = int(d.get("wins", 0))
+    losses = int(d.get("losses", 0))
+    open_ = int(d.get("open", 0))
+    total = int(d.get("signals", 0))
+    closed = wins + losses
+    winrate = (wins / max(1, closed)) * 100.0
+
+    return (
+        f"📊 الحصيلة اليومية {day} (UTC)\n"
+        f"— إشارات: {total}\n"
+        f"— متوسط الثقة: {avg_conf:.1f}/10\n"
+        f"— صفقات مُغلقة: {closed}\n"
+        f"✅ Wins: {wins} | ❌ Losses: {losses} | WinRate: {winrate:.1f}%\n"
+        f"🎯 TP1: {int(d.get('tp1', 0))} | TP2: {int(d.get('tp2', 0))} | TP3: {int(d.get('tp3', 0))}\n"
+        f"⏳ Open: {open_}\n\n"
+        f"ملاحظة: التقييم تقريبي اعتماداً على شموع Yahoo M30."
+    )
+
+
+def maybe_send_daily_report(state: dict) -> None:
+    now = time.gmtime()
+    day = _utc_date_str()
+    last = str(state.get("last_report_date", ""))
+
+    if now.tm_hour == DAILY_REPORT_HOUR and now.tm_min >= DAILY_REPORT_MINUTE and last != day:
+        tg_send_message(CHAT_ID, format_daily_report(state, day))
+        state["last_report_date"] = day
+        save_state(state)
+
+
+# =========================
 # FORMAT + DEDUP
 # =========================
 def format_plan(plan: Plan) -> str:
@@ -682,6 +877,7 @@ HELP_TEXT = (
     "/mode vip_retest  أو  /mode vip_mix\n"
     "/analyze XAU  (أو BTC / US100 / US30 / OIL / EURUSD ...)\n"
     "/scan  (TOP 3 إشارات)\n"
+    "/daily (الحصيلة اليومية)\n"
     "/pause  |  /resume\n"
 )
 
@@ -695,7 +891,12 @@ ALIASES = {
     "/eurusd": "EURUSD",
     "/gbpusd": "GBPUSD",
     "/usdjpy": "USDJPY",
+
+    # ✅ New shortcuts
+    "/ger40": "GER40CASH",
+    "/brent": "BRENTCASH",
 }
+
 
 def _strip_botname(cmd: str) -> str:
     return cmd.split("@", 1)[0] if "@" in cmd else cmd
@@ -735,12 +936,14 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"SL_BUFFER_ATR={SL_BUFFER_ATR}\nMAX_ATR_PCT={MAX_ATR_PCT}\n"
             f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
             f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
+            f"DAILY_REPORT_UTC={DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d}\n"
             f"RISK_PCT={RISK_PCT}\nPAUSED={state.get('paused', False)}"
         )
         return
 
     if cmd == "/symbols":
-        tg_send_message(chat_id, "Symbols: " + ", ".join([f"{k}={v}" for k, v in SYMBOLS.items()]))
+        items = sorted(SYMBOLS.items(), key=lambda x: x[0])
+        tg_send_message(chat_id, "Symbols: " + ", ".join([f"{k}={v}" for k, v in items]))
         return
 
     if cmd == "/mode" and len(parts) >= 2:
@@ -764,6 +967,12 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         tg_send_message(chat_id, "▶️ تم تشغيل الإشارات التلقائية.")
         return
 
+    if cmd == "/daily":
+        update_trade_outcomes(state)
+        tg_send_message(chat_id, format_daily_report(state))
+        save_state(state)
+        return
+
     if cmd == "/analyze" and len(parts) >= 2:
         sym_key = parts[1].upper().strip()
         if sym_key not in SYMBOLS:
@@ -784,6 +993,10 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         img = render_chart(m30, plan)
         if not tg_send_photo(chat_id, caption, img):
             tg_send_message(chat_id, caption)
+
+        # ✅ daily tracking
+        register_trade_for_daily(state, plan)
+        save_state(state)
         return
 
     if cmd == "/scan":
@@ -817,6 +1030,10 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             if not tg_send_photo(chat_id, caption, img):
                 tg_send_message(chat_id, caption)
 
+            # ✅ daily tracking
+            register_trade_for_daily(state, plan)
+            save_state(state)
+
             time.sleep(1)
         return
 
@@ -829,7 +1046,6 @@ def main():
         logger.error("Missing BOT_TOKEN or CHAT_ID in Railway Variables.")
         return
 
-    # Important for getUpdates
     tg_delete_webhook()
 
     me = tg_get_me()
@@ -840,12 +1056,16 @@ def main():
     state = load_state()
     logger.info("VIP bot started. MODE=%s | CHAT_ID=%s", MODE, CHAT_ID)
 
-    tg_send_message(CHAT_ID, "✅ VIP Bot Online (VIP M30 + 20 assets + Liq/BOS + TOP3 scan). اكتب /help")
+    tg_send_message(CHAT_ID, "✅ VIP Bot Online (VIP M30 + Liq/BOS + TOP scan + Daily). اكتب /help")
 
     last_check = 0.0
 
     while True:
         try:
+            # ✅ update outcomes + daily report
+            update_trade_outcomes(state)
+            maybe_send_daily_report(state)
+
             # 1) Commands
             offset = int(state.get("tg_offset", 0))
             upd = tg_get_updates(offset)
@@ -886,6 +1106,10 @@ def main():
                     tg_send_message(CHAT_ID, caption)
 
                 mark_sent(state, plan)
+
+                # ✅ daily tracking
+                register_trade_for_daily(state, plan)
+
                 save_state(state)
                 time.sleep(1)
 
