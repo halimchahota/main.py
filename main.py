@@ -6,7 +6,7 @@ import json
 import math
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple, List
 
 import requests
@@ -19,16 +19,6 @@ import matplotlib.pyplot as plt
 
 
 # =========================
-# LOGGING (Railway-friendly)
-# =========================
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
-logger = logging.getLogger("vip_bot")
-
-
-# =========================
 # ENV / CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -37,47 +27,77 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()  # @groupusername OR -100xxxxxxxxxx
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))  # auto scan
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
 # MODE:
-# vip_retest: يرسل فقط إذا السعر قريب/لمس Zone (أكثر دقة وأقل سبام)
-# vip_mix: يسمح بإرسال Pending حتى لو بعيدة قليلاً (حتى MAX_PENDING_DISTANCE_ATR)
+# vip_retest: يرسل فقط إذا السعر قريب/لمس Zone (أقل إشارات وأكثر دقة)
+# vip_mix: يسمح بإرسال Pending إذا كانت ضمن MAX_PENDING_DISTANCE_ATR (إشارات أكثر)
 MODE = os.getenv("MODE", "vip_retest").strip().lower()
 
 # ATR / Zone params
-TOUCH_ATR_MULT = float(os.getenv("TOUCH_ATR_MULT", "0.35"))          # لمس/قرب المنطقة
-RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))                  # شرط قرب لإرسال limit في vip_retest
-MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))
+RETEST_ATR = float(os.getenv("RETEST_ATR", "0.45"))                  # قرب المنطقة لإرسال limit في vip_retest
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.80"))
 SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
-MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.008"))               # فلتر تذبذب قوي
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 UPDATES_TIMEOUT = 30
 
-# EMA (للترند + الرسم)
+# EMA (للترند فقط)
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
+# Liquidity + BOS filters
+USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
+SWING_LEN = int(os.getenv("SWING_LEN", "3"))        # swings pivots
+LOOKBACK_SWEEP = int(os.getenv("LOOKBACK_SWEEP", "60"))
+LOOKBACK_BOS = int(os.getenv("LOOKBACK_BOS", "60"))
+
 # Data windows
-LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "180d")
-LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "120d")
-LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "30d")
+LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "200d")
+LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "140d")
+LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "45d")
+
+# performance tracking
+TRACK_PERFORMANCE = os.getenv("TRACK_PERFORMANCE", "1").strip() == "1"
+PERF_CHECK_EVERY_SEC = int(os.getenv("PERF_CHECK_EVERY_SEC", "180"))  # reuse check interval
+PERF_SUMMARY_EVERY_HOURS = int(os.getenv("PERF_SUMMARY_EVERY_HOURS", "24"))  # auto summary each 24h
 
 # State persistence
-# جرّب اجعلها "state.json" بدل /tmp إذا لاحظت تكرار بسبب restart
-STATE_PATH = os.getenv("STATE_PATH", "state.json")
+STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
 
-# Symbols (Yahoo Finance)
+# =========================
+# SYMBOLS (more assets)
+# =========================
+# ملاحظة: بعض رموز Yahoo قد تتوقف أحياناً. يمكنك تعديلها من متغيرات Railway أيضاً.
 SYMBOLS: Dict[str, str] = {
-    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),       # بديل محتمل: XAUUSD=X
-    "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
-    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
-    "US30": os.getenv("US30_SYMBOL", "^DJI"),
+    # Metals / Commodities
+    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
+    "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
     "OIL": os.getenv("OIL_SYMBOL", "CL=F"),
+    "NG":  os.getenv("NG_SYMBOL",  "NG=F"),
+
+    # Crypto
+    "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
+    "ETH": os.getenv("ETH_SYMBOL", "ETH-USD"),
+    "SOL": os.getenv("SOL_SYMBOL", "SOL-USD"),
+
+    # Indices
+    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
+    "US30":  os.getenv("US30_SYMBOL", "^DJI"),
+    "SPX":   os.getenv("SPX_SYMBOL", "^GSPC"),
+
+    # Forex majors
+    "EURUSD": os.getenv("EURUSD_SYMBOL", "EURUSD=X"),
+    "GBPUSD": os.getenv("GBPUSD_SYMBOL", "GBPUSD=X"),
+    "USDJPY": os.getenv("USDJPY_SYMBOL", "JPY=X"),
+    "AUDUSD": os.getenv("AUDUSD_SYMBOL", "AUDUSD=X"),
 }
 
 TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 
 # =========================
@@ -88,22 +108,23 @@ def load_state() -> dict:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception as e:
-        logger.warning("Failed to load state: %s", e)
-
+    except Exception:
+        pass
     return {
-        "last_sent": {},      # symbol -> {ts, hash}
-        "last_global": {},    # hash -> ts
+        "last_sent": {},     # symbol -> {ts, hash}
         "tg_offset": 0,
         "paused": False,
+        "trades": [],        # active trade tracking
+        "perf_last_summary_ts": 0,
     }
 
 def save_state(state: dict) -> None:
     try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning("Failed to save state: %s", e)
+        logging.warning("Failed to save state: %s", e)
 
 
 # =========================
@@ -113,50 +134,54 @@ def tg_url(method: str) -> str:
     return TELEGRAM_BASE.format(token=BOT_TOKEN, method=method)
 
 def tg_delete_webhook() -> None:
-    """مهم جداً: إذا كان Webhook مفعّل فلن يعمل getUpdates وبالتالي البوت لن يرد على الأوامر."""
+    # مهم لحل 409 conflict إذا كان webhook مفعل سابقاً
     try:
-        r = requests.get(tg_url("deleteWebhook"), params={"drop_pending_updates": True}, timeout=REQUEST_TIMEOUT)
-        if not r.ok:
-            logger.warning("deleteWebhook failed: %s | %s", r.status_code, r.text[:200])
+        r = requests.get(tg_url("deleteWebhook"), params={"drop_pending_updates": False}, timeout=REQUEST_TIMEOUT)
+        if r.ok:
+            logging.info("deleteWebhook OK")
         else:
-            logger.info("deleteWebhook OK")
+            logging.warning("deleteWebhook failed: %s %s", r.status_code, r.text[:200])
     except Exception as e:
-        logger.warning("deleteWebhook error: %s", e)
+        logging.warning("deleteWebhook error: %s", e)
 
 def tg_send_message(chat_id: str, text: str) -> bool:
     try:
         payload = {"chat_id": chat_id, "text": text[:4096], "disable_web_page_preview": True}
         r = requests.post(tg_url("sendMessage"), json=payload, timeout=REQUEST_TIMEOUT)
         if not r.ok:
-            logger.error("sendMessage failed: %s | %s", r.status_code, r.text[:300])
+            logging.error("sendMessage failed: %s | %s", r.status_code, r.text[:300])
             return False
         return True
     except Exception as e:
-        logger.error("sendMessage error: %s", e)
+        logging.error("sendMessage error: %s", e)
         return False
 
 def tg_send_photo(chat_id: str, caption: str, image_bytes: bytes) -> bool:
     try:
-        caption = (caption or "")[:900]  # safe under caption limit
+        caption = (caption or "")[:1000]
         files = {"photo": ("chart.png", image_bytes, "image/png")}
         data = {"chat_id": chat_id, "caption": caption}
         r = requests.post(tg_url("sendPhoto"), data=data, files=files, timeout=REQUEST_TIMEOUT)
         if not r.ok:
-            logger.error("sendPhoto failed: %s | %s", r.status_code, r.text[:300])
+            logging.error("sendPhoto failed: %s | %s", r.status_code, r.text[:300])
             return False
         return True
     except Exception as e:
-        logger.error("sendPhoto error: %s", e)
+        logging.error("sendPhoto error: %s", e)
         return False
 
 def tg_get_updates(offset: int) -> dict:
     try:
-        params = {"timeout": UPDATES_TIMEOUT, "offset": offset, "allowed_updates": ["message", "channel_post"]}
+        params = {
+            "timeout": UPDATES_TIMEOUT,
+            "offset": offset,
+            "allowed_updates": json.dumps(["message", "channel_post"]),
+        }
         r = requests.get(tg_url("getUpdates"), params=params, timeout=UPDATES_TIMEOUT + 10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        logger.error("getUpdates error: %s", e)
+        logging.error("getUpdates error: %s", e)
         return {"ok": False, "result": []}
 
 
@@ -169,7 +194,6 @@ def yf_download_safe(symbol: str, period: str, interval: str) -> Optional[pd.Dat
         if df is None or df.empty:
             return None
 
-        # flatten if needed
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
 
@@ -182,7 +206,7 @@ def yf_download_safe(symbol: str, period: str, interval: str) -> Optional[pd.Dat
             return None
         return df
     except Exception as e:
-        logger.error("yfinance failed %s %s %s: %s", symbol, period, interval, e)
+        logging.error("yfinance failed %s %s %s: %s", symbol, period, interval, e)
         return None
 
 def ema(series: pd.Series, n: int) -> pd.Series:
@@ -211,6 +235,81 @@ def trend_score(df: pd.DataFrame) -> int:
     if f.iloc[-1] < s.iloc[-1] and slope < 0:
         return -1
     return 0
+
+
+# =========================
+# LIQUIDITY + BOS (simple but effective)
+# =========================
+def pivots(series: pd.Series, left: int, right: int) -> Tuple[List[int], List[int]]:
+    # returns pivot_high_idx, pivot_low_idx
+    highs, lows = [], []
+    vals = series.values
+    for i in range(left, len(vals) - right):
+        window = vals[i-left:i+right+1]
+        if vals[i] == max(window):
+            highs.append(i)
+        if vals[i] == min(window):
+            lows.append(i)
+    return highs, lows
+
+def detect_liquidity_sweep(df: pd.DataFrame, side: str) -> bool:
+    """
+    Sweep (أخذ سيولة) بشكل بسيط:
+    - BUY: شمعة عملت low أقل من آخر pivot low ثم أغلقت فوقه
+    - SELL: شمعة عملت high أعلى من آخر pivot high ثم أغلقت تحته
+    """
+    d = df.tail(max(LOOKBACK_SWEEP, 100)).copy().reset_index(drop=True)
+    if len(d) < 30:
+        return False
+
+    pivot_highs, pivot_lows = pivots(d["Close"], SWING_LEN, SWING_LEN)
+    if not pivot_highs and not pivot_lows:
+        return False
+
+    last = d.iloc[-1]
+    prev = d.iloc[-2]
+
+    if side == "BUY":
+        if not pivot_lows:
+            return False
+        last_pivot_idx = pivot_lows[-1]
+        pivot_price = float(d.loc[last_pivot_idx, "Low"])
+        # sweep: wick below pivot then close above
+        return (float(last["Low"]) < pivot_price) and (float(last["Close"]) > pivot_price)
+
+    else:
+        if not pivot_highs:
+            return False
+        last_pivot_idx = pivot_highs[-1]
+        pivot_price = float(d.loc[last_pivot_idx, "High"])
+        return (float(last["High"]) > pivot_price) and (float(last["Close"]) < pivot_price)
+
+def detect_bos(df: pd.DataFrame, side: str) -> bool:
+    """
+    BOS بسيط:
+    - BUY: إغلاق فوق آخر pivot high
+    - SELL: إغلاق تحت آخر pivot low
+    """
+    d = df.tail(max(LOOKBACK_BOS, 100)).copy().reset_index(drop=True)
+    if len(d) < 30:
+        return False
+
+    pivot_highs, pivot_lows = pivots(d["Close"], SWING_LEN, SWING_LEN)
+    close_now = float(d["Close"].iloc[-1])
+
+    if side == "BUY":
+        if not pivot_highs:
+            return False
+        last_pivot_idx = pivot_highs[-1]
+        level = float(d.loc[last_pivot_idx, "High"])
+        return close_now > level
+
+    else:
+        if not pivot_lows:
+            return False
+        last_pivot_idx = pivot_lows[-1]
+        level = float(d.loc[last_pivot_idx, "Low"])
+        return close_now < level
 
 
 # =========================
@@ -301,8 +400,8 @@ class Plan:
     atr_value: float
     confidence: int
     risk_usd: float
-    # extra: pending suggestions (بعيدة/معلقة)
-    pending_entries: Optional[List[float]] = None
+    liq: bool
+    bos: bool
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
     r = abs(entry - sl)
@@ -323,7 +422,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     t_h4 = trend_score(h4)
     overall = t_d1 + t_h4
 
-    # Decide direction
     if overall >= 1:
         side = "BUY"
     elif overall <= -1:
@@ -341,6 +439,7 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
         return None
 
+    # zones priority
     direction = "BUY" if side == "BUY" else "SELL"
     ob = find_orderblock(m30, direction)
     fvg = find_fvg(m30, direction)
@@ -358,7 +457,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     entry = px
     zone_low = None
     zone_high = None
-    pending_entries: List[float] = []
 
     if zone:
         zone_low, zone_high = float(min(zone[0], zone[1])), float(max(zone[0], zone[1]))
@@ -366,31 +464,25 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         dist_atr = abs(px - mid) / (a + 1e-9)
 
         if MODE == "vip_retest":
-            # send only if price is close enough to zone (retest)
             if dist_atr <= RETEST_ATR:
                 entry_type = "LIMIT"
                 entry = mid
             else:
                 return None
-
         else:
-            # vip_mix:
-            # 1) إذا قريب: LIMIT على منتصف المنطقة
-            # 2) إذا بعيد لكن داخل MAX_PENDING_DISTANCE_ATR: نرسل "أوامر معلقة بعيدة" (2 مستويات)
-            if dist_atr <= RETEST_ATR:
+            if dist_atr <= MAX_PENDING_DISTANCE_ATR:
                 entry_type = "LIMIT"
                 entry = mid
-            elif dist_atr <= MAX_PENDING_DISTANCE_ATR:
-                entry_type = "MARKET"  # نرسل كإشارة عامة + نضيف pending مقترحة
-                # pending 2 levels: mid + edge
-                pending_entries = [mid]
-                if side == "BUY":
-                    pending_entries.append(zone_low)
-                else:
-                    pending_entries.append(zone_high)
-            else:
-                # بعيد جداً
-                return None
+
+    # Liquidity + BOS filters (رفع الجودة)
+    liq_ok = True
+    bos_ok = True
+    if USE_LIQ_BOS:
+        # نطلب أحدهما على الأقل (liq أو bos) + الأفضل الاثنين
+        liq_ok = detect_liquidity_sweep(m30, side)
+        bos_ok = detect_bos(m30, side)
+        if not (liq_ok or bos_ok):
+            return None
 
     # SL beyond zone with buffer, else ATR based
     if side == "BUY":
@@ -406,11 +498,13 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
 
     tp1, tp2, tp3 = calc_rr_targets(entry, sl, side)
 
+    # confidence (simple)
     conf = 5
     conf += 2 if abs(overall) == 2 else 1
-    conf += 2 if (zone_name in ("OrderBlock", "FVG")) else 0
-    conf += 1 if entry_type == "LIMIT" else 0
-    conf -= 1 if (a / (abs(px) + 1e-9)) > (0.8 * MAX_ATR_PCT) else 0
+    conf += 2 if entry_type == "LIMIT" and zone_name in ("OrderBlock", "FVG") else 0
+    conf += 2 if USE_LIQ_BOS and liq_ok else 0
+    conf += 2 if USE_LIQ_BOS and bos_ok else 0
+    conf -= 1 if (a / (abs(px) + 1e-9)) > (0.85 * MAX_ATR_PCT) else 0
     conf = int(max(1, min(10, conf)))
 
     risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
@@ -435,12 +529,13 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         atr_value=float(a),
         confidence=conf,
         risk_usd=round(float(risk_usd), 2),
-        pending_entries=[round(x, 2) for x in pending_entries] if pending_entries else None
+        liq=bool(liq_ok),
+        bos=bool(bos_ok),
     )
 
 
 # =========================
-# CHART IMAGE (Candles + EMAs)
+# CHART IMAGE
 # =========================
 def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     d = df.tail(120).copy()
@@ -461,19 +556,16 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
         ax.plot([x[i], x[i]], [l[i], h[i]], linewidth=1)
         y0 = min(o[i], c[i])
         y1 = max(o[i], c[i])
-        rect = plt.Rectangle((x[i] - 0.35, y0), 0.7, max(y1 - y0, 1e-9), fill=False, linewidth=1)
+        rect = plt.Rectangle((x[i]-0.35, y0), 0.7, max(y1 - y0, 1e-9), fill=False, linewidth=1)
         ax.add_patch(rect)
 
-    # EMAs
     ax.plot(x, d["EMA_FAST"].values, linewidth=1.2, label=f"EMA{EMA_FAST}")
     ax.plot(x, d["EMA_SLOW"].values, linewidth=1.2, label=f"EMA{EMA_SLOW}")
 
-    # zone shading
     if plan.zone_low is not None and plan.zone_high is not None:
-        ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.18)
+        ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.15)
 
-    # levels
-    ax.axhline(plan.entry, linewidth=1.3)
+    ax.axhline(plan.entry, linewidth=1.2)
     ax.axhline(plan.sl, linewidth=1.2)
     ax.axhline(plan.tp1, linewidth=1.0)
     ax.axhline(plan.tp2, linewidth=1.0)
@@ -484,7 +576,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     ax.legend(loc="upper left", fontsize=9)
 
     idx = d.index
-    step = max(1, len(d) // 6)
+    step = max(1, len(d)//6)
     ticks = list(range(0, len(d), step))
     ax.set_xticks(ticks)
     ax.set_xticklabels([str(idx[i])[:16] for i in ticks], rotation=15, ha="right", fontsize=8)
@@ -511,21 +603,14 @@ def format_plan(plan: Plan) -> str:
     if plan.zone_low is not None and plan.zone_high is not None:
         zone_txt = f"{plan.zone_name} [{plan.zone_low:.2f} - {plan.zone_high:.2f}]"
 
-    pending_txt = ""
-    if plan.pending_entries:
-        p_lines = []
-        if plan.side == "BUY":
-            for i, p in enumerate(plan.pending_entries, start=1):
-                p_lines.append(f"• Buy Limit #{i}: {p:.2f}")
-        else:
-            for i, p in enumerate(plan.pending_entries, start=1):
-                p_lines.append(f"• Sell Limit #{i}: {p:.2f}")
-        pending_txt = "\n\n📌 Pending (بعيدة):\n" + "\n".join(p_lines)
+    liq_txt = "✅" if plan.liq else "❌"
+    bos_txt = "✅" if plan.bos else "❌"
 
     return (
         f"🔥 VIP M30\n"
         f"📌 {plan.label} ({plan.symbol})\n"
-        f"Trend D1/H4: {plan.trend_d1:+d} / {plan.trend_h4:+d} => Overall: {plan.overall:+d}\n\n"
+        f"Trend D1/H4: {plan.trend_d1:+d} / {plan.trend_h4:+d} => Overall: {plan.overall:+d}\n"
+        f"Liq Sweep: {liq_txt} | BOS: {bos_txt}\n\n"
         f"{side_emoji} {order}: {plan.entry:.2f}\n"
         f"SL: {plan.sl:.2f}\n"
         f"TP1: {plan.tp1:.2f}\n"
@@ -535,49 +620,157 @@ def format_plan(plan: Plan) -> str:
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
         f"Confidence: {plan.confidence}/10\n"
         f"Mode: {MODE}\n"
-        f"{pending_txt}"
     )
 
 def signal_hash(plan: Plan) -> str:
-    key = (
-        f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry:.2f}|"
-        f"{plan.sl:.2f}|{plan.tp1:.2f}|{plan.tp2:.2f}|{plan.tp3:.2f}|"
-        f"{plan.zone_name}|{plan.zone_low}|{plan.zone_high}|{plan.pending_entries}"
-    )
+    key = f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry:.2f}|{plan.sl:.2f}|{plan.tp1:.2f}|{plan.tp2:.2f}|{plan.tp3:.2f}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}|liq={int(plan.liq)}|bos={int(plan.bos)}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 def should_send(state: dict, plan: Plan) -> bool:
     now = time.time()
-    cooldown = COOLDOWN_MINUTES * 60
-
-    h = signal_hash(plan)
-
-    # 1) Global anti-duplicate (حتى لو restart)
-    last_global = state.get("last_global", {})
-    ts_g = float(last_global.get(h, 0))
-    if (now - ts_g) < cooldown:
-        return False
-
-    # 2) Per-symbol cooldown
     rec = state.get("last_sent", {}).get(plan.symbol, {})
     last_ts = float(rec.get("ts", 0))
+    last_hash = rec.get("hash", "")
+
+    h = signal_hash(plan)
+    cooldown = COOLDOWN_MINUTES * 60
+
+    # 1) block during cooldown for this symbol
     if (now - last_ts) < cooldown:
+        return False
+
+    # 2) block same hash even بعد cooldown قصير (احتياط)
+    if h == last_hash and (now - last_ts) < (2 * cooldown):
         return False
 
     return True
 
 def mark_sent(state: dict, plan: Plan) -> None:
-    now = time.time()
-    h = signal_hash(plan)
-    state.setdefault("last_sent", {})[plan.symbol] = {"ts": now, "hash": h}
-    state.setdefault("last_global", {})[h] = now
+    state.setdefault("last_sent", {})[plan.symbol] = {"ts": time.time(), "hash": signal_hash(plan)}
 
-    # تنظيف hashes القديمة حتى لا يكبر الملف
-    ttl = max(3600, COOLDOWN_MINUTES * 60 * 4)
-    lg = state.get("last_global", {})
-    for k in list(lg.keys()):
-        if (now - float(lg.get(k, 0))) > ttl:
-            lg.pop(k, None)
+
+# =========================
+# PERFORMANCE TRACKING
+# =========================
+def trade_id(plan: Plan) -> str:
+    base = f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry:.2f}|{plan.sl:.2f}|{plan.tp1:.2f}"
+    return hashlib.md5(base.encode("utf-8")).hexdigest()[:10]
+
+def add_trade(state: dict, plan: Plan, source: str) -> None:
+    if not TRACK_PERFORMANCE:
+        return
+
+    tid = trade_id(plan)
+    # avoid duplicates
+    for t in state.get("trades", []):
+        if t.get("id") == tid and t.get("status") == "OPEN":
+            return
+
+    state.setdefault("trades", []).append({
+        "id": tid,
+        "label": plan.label,
+        "symbol": plan.symbol,
+        "side": plan.side,
+        "entry": plan.entry,
+        "sl": plan.sl,
+        "tp1": plan.tp1,
+        "tp2": plan.tp2,
+        "tp3": plan.tp3,
+        "opened_ts": time.time(),
+        "status": "OPEN",   # OPEN / TP1 / SL / TP2 / TP3
+        "source": source,   # AUTO / CMD
+    })
+
+def check_trades(state: dict) -> int:
+    """
+    تحديث صفقات OPEN:
+    نعتبر التنفيذ حصل عند إرسال الإشارة (تقريب).
+    ثم نراقب: إذا High/Low لمس TP1 أو SL أولاً.
+    """
+    if not TRACK_PERFORMANCE:
+        return 0
+
+    changed = 0
+    trades = state.get("trades", [])
+    if not trades:
+        return 0
+
+    for t in trades:
+        if t.get("status") != "OPEN":
+            continue
+
+        sym = t["symbol"]
+        df = yf_download_safe(sym, "7d", "30m")
+        if df is None or df.empty:
+            continue
+
+        high = float(df["High"].iloc[-1])
+        low = float(df["Low"].iloc[-1])
+
+        side = t["side"]
+        sl = float(t["sl"])
+        tp1 = float(t["tp1"])
+        tp2 = float(t["tp2"])
+        tp3 = float(t["tp3"])
+
+        # check touch
+        if side == "BUY":
+            sl_hit = low <= sl
+            tp1_hit = high >= tp1
+            tp2_hit = high >= tp2
+            tp3_hit = high >= tp3
+        else:
+            sl_hit = high >= sl
+            tp1_hit = low <= tp1
+            tp2_hit = low <= tp2
+            tp3_hit = low <= tp3
+
+        # priority: SL vs TP1 first cannot be perfect without intrabar order
+        # approximation: if both hit same bar => نعتبر SL أولاً للحذر
+        if sl_hit and tp1_hit:
+            t["status"] = "SL"
+            changed += 1
+        elif sl_hit:
+            t["status"] = "SL"
+            changed += 1
+        elif tp3_hit:
+            t["status"] = "TP3"
+            changed += 1
+        elif tp2_hit:
+            t["status"] = "TP2"
+            changed += 1
+        elif tp1_hit:
+            t["status"] = "TP1"
+            changed += 1
+
+    if changed:
+        save_state(state)
+    return changed
+
+def performance_summary(state: dict) -> str:
+    trades = state.get("trades", [])
+    if not trades:
+        return "📊 الأداء: لا توجد صفقات مسجلة بعد."
+
+    total = len(trades)
+    open_n = sum(1 for t in trades if t.get("status") == "OPEN")
+    tp1 = sum(1 for t in trades if t.get("status") == "TP1")
+    tp2 = sum(1 for t in trades if t.get("status") == "TP2")
+    tp3 = sum(1 for t in trades if t.get("status") == "TP3")
+    sl = sum(1 for t in trades if t.get("status") == "SL")
+
+    closed = total - open_n
+    win = tp1 + tp2 + tp3
+    winrate = (100.0 * win / closed) if closed > 0 else 0.0
+
+    return (
+        "📊 VIP PERFORMANCE\n"
+        f"Total signals tracked: {total}\n"
+        f"OPEN: {open_n}\n"
+        f"TP1: {tp1} | TP2: {tp2} | TP3: {tp3}\n"
+        f"SL: {sl}\n"
+        f"Winrate (closed): {winrate:.1f}%\n"
+    )
 
 
 # =========================
@@ -589,67 +782,30 @@ HELP_TEXT = (
     "/status\n"
     "/symbols\n"
     "/mode vip_retest  أو  /mode vip_mix\n"
-    "/analyze XAU  (أو BTC / US100 / US30 / OIL)\n"
+    "/analyze XAU  (أو BTC / US100 / US30 / OIL ...)\n"
     "/scan  (أفضل إشارة)\n"
-    "/pause  |  /resume\n\n"
-    "ملاحظة: داخل المجموعات أحياناً تحتاج:\n"
-    "/help@اسم_البوت\n"
+    "/performance\n"
+    "/pause  |  /resume\n"
 )
-
-def _normalize_symbol_text(txt: str) -> Optional[str]:
-    t = (txt or "").strip().upper()
-    if not t:
-        return None
-    # aliases
-    aliases = {
-        "GOLD": "XAU",
-        "XAUUSD": "XAU",
-        "XAU/USD": "XAU",
-        "NAS100": "US100",
-        "NQ": "US100",
-        "US-100": "US100",
-        "DOW": "US30",
-        "DJI": "US30",
-        "US-30": "US30",
-        "WTI": "OIL",
-        "OIL": "OIL",
-    }
-    return aliases.get(t, t)
-
-def _strip_botname(cmd: str) -> str:
-    # /help@mybot -> /help
-    if "@" in cmd:
-        return cmd.split("@", 1)[0]
-    return cmd
 
 def handle_command(state: dict, update: dict) -> None:
     msg = update.get("message") or update.get("channel_post") or {}
     text = (msg.get("text") or "").strip()
-    if not text:
-        return
-
-    chat = msg.get("chat", {})
-    chat_id = str(chat.get("id", "")) if chat.get("id") is not None else ""
-    if not chat_id:
-        return
-
-    # إذا تريد تقييد الأوامر فقط على نفس CHAT_ID:
-    # اجعل ALLOW_ANY_CHAT=0
-    allow_any = os.getenv("ALLOW_ANY_CHAT", "1").strip() == "1"
-    if (not allow_any) and CHAT_ID and (chat_id != CHAT_ID) and (str(chat.get("username", "")) != CHAT_ID.lstrip("@")):
-        return
-
-    # أوامر تبدأ بـ /
     if not text.startswith("/"):
         return
 
+    chat = msg.get("chat", {})
+    chat_id = str(chat.get("id", "")) or CHAT_ID  # يرد في نفس الكروب
+
     parts = text.split()
-    cmd_raw = parts[0].lower()
-    cmd = _strip_botname(cmd_raw)
+    cmd = parts[0].lower().split("@")[0]  # يسمح /help أو /help@bot
 
     global MODE
 
-    if cmd in ("/help", "/halp"):  # دعم خطأ كتابي شائع
+    if cmd in ("/halp", "/halp@"):  # لو كتبتها غلط
+        cmd = "/help"
+
+    if cmd == "/help":
         tg_send_message(chat_id, HELP_TEXT)
         return
 
@@ -658,7 +814,9 @@ def handle_command(state: dict, update: dict) -> None:
             chat_id,
             f"MODE={MODE}\nCHECK_INTERVAL_SEC={CHECK_INTERVAL_SEC}\nCOOLDOWN_MINUTES={COOLDOWN_MINUTES}\n"
             f"RETEST_ATR={RETEST_ATR}\nMAX_PENDING_DISTANCE_ATR={MAX_PENDING_DISTANCE_ATR}\n"
-            f"SL_BUFFER_ATR={SL_BUFFER_ATR}\nMAX_ATR_PCT={MAX_ATR_PCT}\nRISK_PCT={RISK_PCT}\nPAUSED={state.get('paused', False)}"
+            f"SL_BUFFER_ATR={SL_BUFFER_ATR}\nMAX_ATR_PCT={MAX_ATR_PCT}\n"
+            f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\nSWING_LEN={SWING_LEN}\n"
+            f"RISK_PCT={RISK_PCT}\nPAUSED={state.get('paused', False)}"
         )
         return
 
@@ -687,16 +845,17 @@ def handle_command(state: dict, update: dict) -> None:
         tg_send_message(chat_id, "▶️ تم تشغيل الإشارات التلقائية.")
         return
 
-    # analyze + aliases shortcuts: /xau /btc /us100 ...
-    if cmd in ("/analyze", "/xau", "/btc", "/us100", "/us30", "/oil", "/xauusd"):
-        if cmd != "/analyze":
-            sym_key = _normalize_symbol_text(cmd.replace("/", ""))
-        else:
-            if len(parts) < 2:
-                tg_send_message(chat_id, "اكتب مثال: /analyze XAU")
-                return
-            sym_key = _normalize_symbol_text(parts[1])
+    if cmd == "/performance":
+        # تحديث سريع قبل عرض الملخص
+        try:
+            check_trades(state)
+        except Exception:
+            pass
+        tg_send_message(chat_id, performance_summary(state))
+        return
 
+    if cmd == "/analyze" and len(parts) >= 2:
+        sym_key = parts[1].upper().strip()
         if sym_key not in SYMBOLS:
             tg_send_message(chat_id, "❌ الرمز غير معروف. جرّب /symbols")
             return
@@ -713,8 +872,12 @@ def handle_command(state: dict, update: dict) -> None:
 
         caption = format_plan(plan)
         img = render_chart(m30, plan)
+
         if not tg_send_photo(chat_id, caption, img):
             tg_send_message(chat_id, caption)
+
+        add_trade(state, plan, source="CMD")
+        save_state(state)
         return
 
     if cmd == "/scan":
@@ -737,8 +900,12 @@ def handle_command(state: dict, update: dict) -> None:
 
         caption = "🔥 BEST VIP SIGNAL\n\n" + format_plan(best)
         img = render_chart(m30, best)
+
         if not tg_send_photo(chat_id, caption, img):
             tg_send_message(chat_id, caption)
+
+        add_trade(state, best, source="CMD")
+        save_state(state)
         return
 
 
@@ -747,19 +914,19 @@ def handle_command(state: dict, update: dict) -> None:
 # =========================
 def main():
     if not BOT_TOKEN or not CHAT_ID:
-        logger.error("Missing BOT_TOKEN or CHAT_ID in Railway Variables.")
+        logging.error("Missing BOT_TOKEN or CHAT_ID in Railway Variables.")
         return
 
-    # مهم للأوامر:
+    # مهم جداً لتجنب 409 conflict
     tg_delete_webhook()
 
     state = load_state()
-    logger.info("VIP bot started. MODE=%s | CHAT_ID=%s", MODE, CHAT_ID)
+    logging.info("VIP bot started. MODE=%s | CHAT_ID=%s", MODE, CHAT_ID)
 
-    # Startup message
-    tg_send_message(CHAT_ID, "✅ VIP Bot Online (M30 + Chart + Auto + Commands). اكتب /help")
+    tg_send_message(CHAT_ID, "✅ VIP Bot Online (More Assets + Liquidity/BOS + Performance). اكتب /help")
 
     last_check = 0.0
+    last_perf_check = 0.0
 
     while True:
         try:
@@ -772,12 +939,26 @@ def main():
                     handle_command(state, u)
                 save_state(state)
 
-            # 2) Auto signals
+            # 2) Performance checks
+            now = time.time()
+            if TRACK_PERFORMANCE and (now - last_perf_check) >= PERF_CHECK_EVERY_SEC:
+                last_perf_check = now
+                changed = check_trades(state)
+                if changed:
+                    logging.info("Performance updated: %s trades changed", changed)
+
+                # auto summary each N hours
+                last_sum = float(state.get("perf_last_summary_ts", 0))
+                if (now - last_sum) >= (PERF_SUMMARY_EVERY_HOURS * 3600):
+                    state["perf_last_summary_ts"] = now
+                    save_state(state)
+                    tg_send_message(CHAT_ID, performance_summary(state))
+
+            # 3) Auto signals
             if state.get("paused", False):
                 time.sleep(1)
                 continue
 
-            now = time.time()
             if now - last_check < CHECK_INTERVAL_SEC:
                 time.sleep(1)
                 continue
@@ -803,11 +984,12 @@ def main():
                     tg_send_message(CHAT_ID, caption)
 
                 mark_sent(state, plan)
+                add_trade(state, plan, source="AUTO")
                 save_state(state)
                 time.sleep(1)  # avoid Telegram burst
 
         except Exception as e:
-            logger.exception("Main loop error: %s", e)
+            logging.exception("Main loop error: %s", e)
             time.sleep(5)
 
 
