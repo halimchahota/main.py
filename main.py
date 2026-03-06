@@ -40,22 +40,13 @@ CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
 # MODE: vip_retest | vip_mix
-# vip_retest: يشترط قرب قوي من المنطقة (أقل إشارات / أعلى دقة)
-# vip_mix: يسمح بمسافة أكبر للـ pending (إشارات أكثر)
 MODE = os.getenv("MODE", "vip_retest").strip().lower()
 
 # ATR / Zone params
-RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))                  # قرب المنطقة للـ retest
-MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))  # pending في vip_mix
+RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))
 SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
-
-# ✅ SMART ENTRY
-SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
-# إذا كانت إشارة BOS قوية والسعر ليس بعيدًا جداً => Market
-MARKET_ATR_MAX = float(os.getenv("MARKET_ATR_MAX", "0.35"))  # كلما صغرت -> Market أقل وأكثر دقة
-# إذا كانت السيولة موجودة (Liquidity sweep) نميل للـ Limit أكثر
-LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 UPDATES_TIMEOUT = 30
@@ -75,11 +66,28 @@ STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
 # Liquidity + BOS
 USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
-MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "7"))  # فلتر /scan (لتقليل السبام)
+MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "8"))  # أقوى من 7
 
 # Daily report (UTC)
-DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))      # UTC hour
-DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))  # UTC minute
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))
+
+# =========================
+# VIP STRONGER FILTERS
+# =========================
+USE_SESSION_FILTER = os.getenv("USE_SESSION_FILTER", "1").strip() == "1"
+
+# London + New York (UTC)
+SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
+SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
+
+# Crypto يعمل 24/7
+CRYPTO_LABELS = {"BTC", "ETH"}
+
+# Smart Entry
+SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
+MARKET_ATR_MAX = float(os.getenv("MARKET_ATR_MAX", "0.25"))  # أقوى من 0.35
+LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
 
 
 # =========================
@@ -102,7 +110,7 @@ SYMBOLS: Dict[str, str] = {
     "DAX":   os.getenv("DAX_SYMBOL", "^GDAXI"),
     "HK50":  os.getenv("HK50_SYMBOL", "^HSI"),
 
-    # ✅ Requested additions
+    # Requested additions
     "GER40CASH": os.getenv("GER40CASH_SYMBOL", "^GDAXI"),
     "BRENTCASH": os.getenv("BRENTCASH_SYMBOL", "BZ=F"),
 
@@ -122,7 +130,30 @@ TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
 # =========================
-# PRICE FORMATTING (Forex = 5, JPY = 3)
+# SESSION FILTER HELPERS
+# =========================
+def is_crypto_label(label: str) -> bool:
+    return label.upper() in CRYPTO_LABELS
+
+
+def session_allowed_for_symbol(label: str) -> bool:
+    """
+    Forex / indices / metals / oil: فقط London + New York
+    Crypto: 24/7
+    """
+    if not USE_SESSION_FILTER:
+        return True
+
+    if is_crypto_label(label):
+        return True
+
+    now = time.gmtime()
+    hour = now.tm_hour
+    return SESSION_START_UTC <= hour < SESSION_END_UTC
+
+
+# =========================
+# PRICE FORMATTING
 # =========================
 def price_decimals(label: str, px: float) -> int:
     label = (label or "").upper()
@@ -197,7 +228,6 @@ def tg_url(method: str) -> str:
 
 
 def tg_delete_webhook() -> None:
-    """إذا webhook مفعّل، getUpdates لا يعمل."""
     try:
         r = requests.get(tg_url("deleteWebhook"), params={"drop_pending_updates": False}, timeout=REQUEST_TIMEOUT)
         if r.ok:
@@ -318,7 +348,7 @@ def trend_score(df: pd.DataFrame) -> int:
 
 
 # =========================
-# LIQUIDITY + BOS (simple, practical)
+# LIQUIDITY + BOS
 # =========================
 def detect_liq_sweep(df: pd.DataFrame, a: float) -> bool:
     if df is None or len(df) < 60 or a <= 0:
@@ -346,7 +376,7 @@ def detect_bos(df: pd.DataFrame, side: str) -> bool:
 
 
 # =========================
-# ZONES (OrderBlock + FVG)
+# ZONES
 # =========================
 def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
     if len(df) < 60:
@@ -421,8 +451,8 @@ class Plan:
     trend_d1: int
     trend_h4: int
     overall: int
-    side: str          # BUY/SELL
-    entry_type: str    # MARKET/LIMIT
+    side: str
+    entry_type: str
     entry: float
     sl: float
     tp1: float
@@ -493,7 +523,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         zone_name = "FVG"
         zone = fvg
 
-    # نطلب Zone لكي تكون الإشارة منطقية (Smart Money)
     if zone is None:
         return None
 
@@ -501,64 +530,47 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     mid = (zone_low + zone_high) / 2.0
     dist_atr = abs(px - mid) / (a + 1e-9)
 
-    # =========================
-    # ✅ SMART ENTRY DECISION
-    # =========================
+    # Smart Entry Decision
     entry_type = "LIMIT"
     entry = mid
 
-    # شروط قوة الترند (تساعد Market)
     strong_trend = abs(overall) == 2
+    allow_market = SMART_ENTRY and bos and strong_trend and (dist_atr <= MARKET_ATR_MAX)
 
-    # Market فقط عندما BOS قوي (غالباً استمرار) والسعر ليس بعيد عن المنطقة
-    allow_market = SMART_ENTRY and bos and (strong_trend or (not liq)) and (dist_atr <= MARKET_ATR_MAX)
-
-    # إذا Liquidity sweep موجود: نفضل Limit (ارتداد/سحب سيولة ثم رجوع)
-    if SMART_ENTRY and LIQ_FAVOR_LIMIT and liq and not bos:
+    if LIQ_FAVOR_LIMIT and liq and not bos:
         allow_market = False
 
-    # احترام MODE
     if MODE == "vip_retest":
-        # لازم قريب جدا
         if dist_atr > RETEST_ATR:
             return None
 
-        # داخل الريتيست: نقرر Market أو Limit
         if allow_market:
             entry_type = "MARKET"
             entry = px
         else:
             entry_type = "LIMIT"
             entry = mid
-
     else:
-        # vip_mix
-        # إذا Market مسموح: ندخل مباشرة
         if allow_market:
             entry_type = "MARKET"
             entry = px
+        elif dist_atr <= MAX_PENDING_DISTANCE_ATR:
+            entry_type = "LIMIT"
+            entry = mid
         else:
-            # Limit إذا ضمن المسافة القصوى
-            if dist_atr <= MAX_PENDING_DISTANCE_ATR:
-                entry_type = "LIMIT"
-                entry = mid
-            else:
-                return None
+            return None
 
-    # SL beyond zone with buffer
     if side == "BUY":
         sl = zone_low - (SL_BUFFER_ATR * a)
     else:
         sl = zone_high + (SL_BUFFER_ATR * a)
 
-    # حماية: لا تجعل SL قريب جداً من entry
     min_r = 0.25 * a
     if abs(entry - sl) < min_r:
         sl = (entry - 1.5 * a) if side == "BUY" else (entry + 1.5 * a)
 
     tp1, tp2, tp3 = calc_rr_targets(entry, sl, side)
 
-    # Confidence score
     conf = 5
     conf += 2 if strong_trend else 1
     conf += 2 if zone_name in ("OrderBlock", "FVG") else 0
@@ -595,7 +607,7 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
 
 
 # =========================
-# CHART IMAGE (Candles + EMAs + Zone + Levels)
+# CHART IMAGE
 # =========================
 def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     d = df.tail(120).copy()
@@ -611,7 +623,6 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     fig = plt.figure(figsize=(10.5, 6.2), dpi=150)
     ax = plt.gca()
 
-    # Candles
     for i in range(len(d)):
         ax.plot([x[i], x[i]], [l[i], h[i]], linewidth=1)
         y0 = min(o[i], c[i])
@@ -619,15 +630,12 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
         rect = plt.Rectangle((x[i] - 0.35, y0), 0.7, max(y1 - y0, 1e-9), fill=False, linewidth=1)
         ax.add_patch(rect)
 
-    # EMAs
     ax.plot(x, d["EMA_FAST"].values, linewidth=1.2, label=f"EMA{EMA_FAST}")
     ax.plot(x, d["EMA_SLOW"].values, linewidth=1.2, label=f"EMA{EMA_SLOW}")
 
-    # Zone shading
     if plan.zone_low is not None and plan.zone_high is not None:
         ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.15)
 
-    # Levels
     ax.axhline(plan.entry, linewidth=1.2)
     ax.axhline(plan.sl, linewidth=1.2)
     ax.axhline(plan.tp1, linewidth=1.0)
@@ -653,7 +661,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
 
 
 # =========================
-# DAILY PERFORMANCE (approx via Yahoo M30)
+# DAILY PERFORMANCE
 # =========================
 def _hit_in_bar(high_: float, low_: float, level: float) -> bool:
     return low_ <= level <= high_
@@ -732,7 +740,6 @@ def update_trade_outcomes(state: dict) -> None:
         tp3 = float(tr.get("tp3", 0))
 
         resolved = None
-        # Conservative: إذا SL و TP في نفس الشمعة => نحسب SL
         for _, row in df2.iterrows():
             hi = float(row["High"])
             lo = float(row["Low"])
@@ -933,7 +940,6 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
     cmd_raw = parts[0].lower()
     cmd = _strip_botname(cmd_raw)
 
-    # Alias shortcuts
     if cmd in ALIASES:
         parts = ["/analyze", ALIASES[cmd]]
         cmd = "/analyze"
@@ -951,7 +957,10 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"RETEST_ATR={RETEST_ATR}\nMAX_PENDING_DISTANCE_ATR={MAX_PENDING_DISTANCE_ATR}\n"
             f"SL_BUFFER_ATR={SL_BUFFER_ATR}\nMAX_ATR_PCT={MAX_ATR_PCT}\n"
             f"SMART_ENTRY={int(SMART_ENTRY)} | MARKET_ATR_MAX={MARKET_ATR_MAX}\n"
-            f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\nMIN_CONF_SCAN={MIN_CONF_SCAN}\n"
+            f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
+            f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
+            f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
+            f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
             f"DAILY_REPORT_UTC={DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d}\n"
             f"RISK_PCT={RISK_PCT}\nPAUSED={state.get('paused', False)}"
         )
@@ -995,6 +1004,10 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             tg_send_message(chat_id, "❌ الرمز غير معروف. جرّب /symbols")
             return
 
+        if not session_allowed_for_symbol(sym_key):
+            tg_send_message(chat_id, f"⏰ {sym_key} خارج جلسة التداول المسموح بها الآن.")
+            return
+
         plan = build_plan(sym_key, SYMBOLS[sym_key])
         if plan is None:
             tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key} حسب شروط VIP.")
@@ -1016,12 +1029,17 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
 
     if cmd == "/scan":
         plans: List[Tuple[int, Plan]] = []
+
         for k, sym in SYMBOLS.items():
+            if not session_allowed_for_symbol(k):
+                continue
+
             p = build_plan(k, sym)
             if p is None:
                 continue
             if p.confidence < MIN_CONF_SCAN:
                 continue
+
             score = p.confidence + (1 if p.liq else 0) + (1 if p.bos else 0)
             plans.append((score, p))
 
@@ -1065,19 +1083,21 @@ def main():
         logger.info("Bot username: @%s", bot_username)
 
     state = load_state()
-    logger.info("VIP bot started. MODE=%s | SMART_ENTRY=%s | CHAT_ID=%s", MODE, int(SMART_ENTRY), CHAT_ID)
+    logger.info(
+        "VIP bot started. MODE=%s | SMART_ENTRY=%s | SESSION_FILTER=%s | CHAT_ID=%s",
+        MODE, int(SMART_ENTRY), int(USE_SESSION_FILTER), CHAT_ID
+    )
 
-    tg_send_message(CHAT_ID, "✅ VIP Bot Online (M30 + Liq/BOS + Smart Entry + Daily). اكتب /help")
+    tg_send_message(CHAT_ID, "✅ VIP Bot Online (Stronger VIP + Smart Entry + Smart Session + Daily). اكتب /help")
 
     last_check = 0.0
 
     while True:
         try:
-            # update outcomes + daily report
             update_trade_outcomes(state)
             maybe_send_daily_report(state)
 
-            # 1) Commands
+            # Commands
             offset = int(state.get("tg_offset", 0))
             upd = tg_get_updates(offset)
             if upd.get("ok") and upd.get("result"):
@@ -1086,7 +1106,7 @@ def main():
                     handle_command(state, u, bot_username)
                 save_state(state)
 
-            # 2) Auto signals
+            # Auto signals
             if state.get("paused", False):
                 time.sleep(1)
                 continue
@@ -1098,6 +1118,9 @@ def main():
             last_check = now
 
             for label, sym in SYMBOLS.items():
+                if not session_allowed_for_symbol(label):
+                    continue
+
                 plan = build_plan(label, sym)
                 if plan is None:
                     continue
@@ -1118,6 +1141,7 @@ def main():
 
                 mark_sent(state, plan)
                 register_trade_for_daily(state, plan)
+
                 save_state(state)
                 time.sleep(1)
 
