@@ -40,13 +40,22 @@ CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
 # MODE: vip_retest | vip_mix
+# vip_retest: يشترط قرب قوي من المنطقة (أقل إشارات / أعلى دقة)
+# vip_mix: يسمح بمسافة أكبر للـ pending (إشارات أكثر)
 MODE = os.getenv("MODE", "vip_retest").strip().lower()
 
 # ATR / Zone params
-RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))                  # شرط قرب لإرسال في vip_retest
-MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))  # يستخدم في vip_mix
+RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))                  # قرب المنطقة للـ retest
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))  # pending في vip_mix
 SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
+
+# ✅ SMART ENTRY
+SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
+# إذا كانت إشارة BOS قوية والسعر ليس بعيدًا جداً => Market
+MARKET_ATR_MAX = float(os.getenv("MARKET_ATR_MAX", "0.35"))  # كلما صغرت -> Market أقل وأكثر دقة
+# إذا كانت السيولة موجودة (Liquidity sweep) نميل للـ Limit أكثر
+LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 UPDATES_TIMEOUT = 30
@@ -74,7 +83,7 @@ DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))  # UTC minute
 
 
 # =========================
-# SYMBOLS (Assets)
+# SYMBOLS
 # =========================
 SYMBOLS: Dict[str, str] = {
     # --- FX (Yahoo: =X) ---
@@ -87,22 +96,22 @@ SYMBOLS: Dict[str, str] = {
     "NZDUSD": os.getenv("NZDUSD_SYMBOL", "NZDUSD=X"),
 
     # --- Indices / Futures ---
-    "US100": os.getenv("US100_SYMBOL", "NQ=F"),     # Nasdaq futures
-    "US30":  os.getenv("US30_SYMBOL", "^DJI"),      # Dow Jones
-    "SPX":   os.getenv("SPX_SYMBOL", "^GSPC"),      # S&P 500
-    "DAX":   os.getenv("DAX_SYMBOL", "^GDAXI"),     # DAX
-    "HK50":  os.getenv("HK50_SYMBOL", "^HSI"),      # Hang Seng
+    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
+    "US30":  os.getenv("US30_SYMBOL", "^DJI"),
+    "SPX":   os.getenv("SPX_SYMBOL", "^GSPC"),
+    "DAX":   os.getenv("DAX_SYMBOL", "^GDAXI"),
+    "HK50":  os.getenv("HK50_SYMBOL", "^HSI"),
 
-    # ✅ Requested additions (cash names)
+    # ✅ Requested additions
     "GER40CASH": os.getenv("GER40CASH_SYMBOL", "^GDAXI"),
     "BRENTCASH": os.getenv("BRENTCASH_SYMBOL", "BZ=F"),
 
     # --- Commodities ---
-    "XAU":    os.getenv("XAU_SYMBOL", "GC=F"),      # Gold
-    "XAG":    os.getenv("XAG_SYMBOL", "SI=F"),      # Silver
-    "OIL":    os.getenv("OIL_SYMBOL", "CL=F"),      # WTI
-    "NG":     os.getenv("NG_SYMBOL", "NG=F"),       # Natural Gas
-    "COPPER": os.getenv("COPPER_SYMBOL", "HG=F"),   # Copper
+    "XAU":    os.getenv("XAU_SYMBOL", "GC=F"),
+    "XAG":    os.getenv("XAG_SYMBOL", "SI=F"),
+    "OIL":    os.getenv("OIL_SYMBOL", "CL=F"),
+    "NG":     os.getenv("NG_SYMBOL", "NG=F"),
+    "COPPER": os.getenv("COPPER_SYMBOL", "HG=F"),
 
     # --- Crypto ---
     "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
@@ -139,7 +148,7 @@ def fmt_price(label: str, x: float, px_hint: float) -> str:
 
 
 # =========================
-# STATE
+# STATE + DAILY HELPERS
 # =========================
 def _utc_date_str(ts: Optional[float] = None) -> str:
     ts = ts if ts is not None else time.time()
@@ -151,7 +160,6 @@ def load_state() -> dict:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 st = json.load(f)
-                # ensure keys exist
                 st.setdefault("last_sent", {})
                 st.setdefault("tg_offset", 0)
                 st.setdefault("paused", False)
@@ -163,12 +171,12 @@ def load_state() -> dict:
         logger.warning("Failed to load state: %s", e)
 
     return {
-        "last_sent": {},       # symbol -> {ts, hash}
+        "last_sent": {},
         "tg_offset": 0,
         "paused": False,
-        "open_trades": {},     # trade_id -> trade dict
-        "daily": {},           # date -> stats
-        "last_report_date": "",# YYYY-MM-DD
+        "open_trades": {},
+        "daily": {},
+        "last_report_date": "",
     }
 
 
@@ -189,7 +197,7 @@ def tg_url(method: str) -> str:
 
 
 def tg_delete_webhook() -> None:
-    """مهم: إذا webhook مفعّل، getUpdates لا يعمل."""
+    """إذا webhook مفعّل، getUpdates لا يعمل."""
     try:
         r = requests.get(tg_url("deleteWebhook"), params={"drop_pending_updates": False}, timeout=REQUEST_TIMEOUT)
         if r.ok:
@@ -313,11 +321,6 @@ def trend_score(df: pd.DataFrame) -> int:
 # LIQUIDITY + BOS (simple, practical)
 # =========================
 def detect_liq_sweep(df: pd.DataFrame, a: float) -> bool:
-    """
-    Sweep مبسط:
-    - كسر أعلى 20 شمعة ثم إغلاق تحته (sweep highs)
-    - أو كسر أدنى 20 ثم إغلاق فوقه (sweep lows)
-    """
     if df is None or len(df) < 60 or a <= 0:
         return False
     d = df.tail(80).copy()
@@ -333,18 +336,12 @@ def detect_liq_sweep(df: pd.DataFrame, a: float) -> bool:
 
 
 def detect_bos(df: pd.DataFrame, side: str) -> bool:
-    """
-    BOS مبسط:
-    - BUY: إغلاق فوق أعلى 20 شمعة
-    - SELL: إغلاق تحت أدنى 20 شمعة
-    """
     if df is None or len(df) < 60:
         return False
     d = df.tail(80).copy()
     swing_high = float(d["High"].iloc[-21:-1].max())
     swing_low = float(d["Low"].iloc[-21:-1].min())
     last_c = float(d["Close"].iloc[-1])
-
     return (last_c > swing_high) if side == "BUY" else (last_c < swing_low)
 
 
@@ -376,7 +373,6 @@ def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, f
         else:
             if c[i] < o[i] and c[i] < l[i - 1] and c[i - 1] > o[i - 1]:
                 return float(l[i - 1]), float(h[i - 1])
-
     return None
 
 
@@ -475,7 +471,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         return None
     a = float(a)
 
-    # Volatility guard
     if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
         return None
 
@@ -483,7 +478,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     bos = detect_bos(m30, side)
 
     if USE_LIQ_BOS and not (liq or bos):
-        # نطلب واحد على الأقل (liq أو bos) لرفع الجودة
         return None
 
     direction = "BUY" if side == "BUY" else "SELL"
@@ -499,37 +493,65 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         zone_name = "FVG"
         zone = fvg
 
-    entry_type = "MARKET"
-    entry = px
-    zone_low = None
-    zone_high = None
+    # نطلب Zone لكي تكون الإشارة منطقية (Smart Money)
+    if zone is None:
+        return None
 
-    if zone:
-        zone_low, zone_high = float(min(zone[0], zone[1])), float(max(zone[0], zone[1]))
-        mid = (zone_low + zone_high) / 2.0
-        dist_atr = abs(px - mid) / (a + 1e-9)
+    zone_low, zone_high = float(min(zone[0], zone[1])), float(max(zone[0], zone[1]))
+    mid = (zone_low + zone_high) / 2.0
+    dist_atr = abs(px - mid) / (a + 1e-9)
 
-        if MODE == "vip_retest":
-            if dist_atr <= RETEST_ATR:
-                entry_type = "LIMIT"
-                entry = mid
-            else:
-                return None
+    # =========================
+    # ✅ SMART ENTRY DECISION
+    # =========================
+    entry_type = "LIMIT"
+    entry = mid
+
+    # شروط قوة الترند (تساعد Market)
+    strong_trend = abs(overall) == 2
+
+    # Market فقط عندما BOS قوي (غالباً استمرار) والسعر ليس بعيد عن المنطقة
+    allow_market = SMART_ENTRY and bos and (strong_trend or (not liq)) and (dist_atr <= MARKET_ATR_MAX)
+
+    # إذا Liquidity sweep موجود: نفضل Limit (ارتداد/سحب سيولة ثم رجوع)
+    if SMART_ENTRY and LIQ_FAVOR_LIMIT and liq and not bos:
+        allow_market = False
+
+    # احترام MODE
+    if MODE == "vip_retest":
+        # لازم قريب جدا
+        if dist_atr > RETEST_ATR:
+            return None
+
+        # داخل الريتيست: نقرر Market أو Limit
+        if allow_market:
+            entry_type = "MARKET"
+            entry = px
         else:
-            # vip_mix
+            entry_type = "LIMIT"
+            entry = mid
+
+    else:
+        # vip_mix
+        # إذا Market مسموح: ندخل مباشرة
+        if allow_market:
+            entry_type = "MARKET"
+            entry = px
+        else:
+            # Limit إذا ضمن المسافة القصوى
             if dist_atr <= MAX_PENDING_DISTANCE_ATR:
                 entry_type = "LIMIT"
                 entry = mid
             else:
                 return None
 
-    # SL beyond zone with buffer, else ATR
+    # SL beyond zone with buffer
     if side == "BUY":
-        sl = (zone_low - (SL_BUFFER_ATR * a)) if zone_low is not None else (entry - 1.5 * a)
+        sl = zone_low - (SL_BUFFER_ATR * a)
     else:
-        sl = (zone_high + (SL_BUFFER_ATR * a)) if zone_high is not None else (entry + 1.5 * a)
+        sl = zone_high + (SL_BUFFER_ATR * a)
 
-    # Guard: لا تسمح SL=Entry
+    # حماية: لا تجعل SL قريب جداً من entry
     min_r = 0.25 * a
     if abs(entry - sl) < min_r:
         sl = (entry - 1.5 * a) if side == "BUY" else (entry + 1.5 * a)
@@ -538,10 +560,11 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
 
     # Confidence score
     conf = 5
-    conf += 2 if abs(overall) == 2 else 1
-    conf += 2 if entry_type == "LIMIT" and zone_name in ("OrderBlock", "FVG") else 0
+    conf += 2 if strong_trend else 1
+    conf += 2 if zone_name in ("OrderBlock", "FVG") else 0
     conf += 1 if liq else 0
     conf += 1 if bos else 0
+    conf += 1 if entry_type == "MARKET" and bos else 0
     conf = int(max(1, min(10, conf)))
 
     risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
@@ -561,8 +584,8 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         tp2=float(tp2),
         tp3=float(tp3),
         zone_name=zone_name,
-        zone_low=float(zone_low) if zone_low is not None else None,
-        zone_high=float(zone_high) if zone_high is not None else None,
+        zone_low=float(zone_low),
+        zone_high=float(zone_high),
         atr_value=float(a),
         confidence=conf,
         risk_usd=float(risk_usd),
@@ -615,7 +638,6 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     ax.grid(True, alpha=0.2)
     ax.legend(loc="upper left", fontsize=9)
 
-    # X labels
     idx = d.index
     step = max(1, len(d) // 6)
     ticks = list(range(0, len(d), step))
@@ -653,7 +675,7 @@ def register_trade_for_daily(state: dict, plan: Plan) -> str:
         "tp1": float(plan.tp1),
         "tp2": float(plan.tp2),
         "tp3": float(plan.tp3),
-        "status": "OPEN",  # OPEN / SL / TP1 / TP2 / TP3
+        "status": "OPEN",
     }
 
     day = _utc_date_str(now)
@@ -704,14 +726,12 @@ def update_trade_outcomes(state: dict) -> None:
         if df2.empty:
             continue
 
-        side = tr.get("side", "BUY")
         sl = float(tr.get("sl", 0))
         tp1 = float(tr.get("tp1", 0))
         tp2 = float(tr.get("tp2", 0))
         tp3 = float(tr.get("tp3", 0))
 
         resolved = None
-
         # Conservative: إذا SL و TP في نفس الشمعة => نحسب SL
         for _, row in df2.iterrows():
             hi = float(row["High"])
@@ -749,7 +769,6 @@ def update_trade_outcomes(state: dict) -> None:
                 "tp3": 0,
                 "open": 0,
             })
-
             daily["open"] = max(0, int(daily.get("open", 0)) - 1)
 
             if resolved == "SL":
@@ -767,7 +786,6 @@ def update_trade_outcomes(state: dict) -> None:
 def format_daily_report(state: dict, day: Optional[str] = None) -> str:
     day = day or _utc_date_str()
     d = state.get("daily", {}).get(day)
-
     if not d:
         return f"📊 الحصيلة اليومية {day} (UTC)\nلا توجد إشارات مسجلة اليوم."
 
@@ -834,7 +852,7 @@ def format_plan(plan: Plan) -> str:
         f"Zone: {zone_txt}\n"
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
         f"Confidence: {plan.confidence}/10\n"
-        f"Mode: {MODE}\n"
+        f"Mode: {MODE} | SMART_ENTRY={int(SMART_ENTRY)}\n"
     )
 
 
@@ -875,8 +893,8 @@ HELP_TEXT = (
     "/status\n"
     "/symbols\n"
     "/mode vip_retest  أو  /mode vip_mix\n"
-    "/analyze XAU  (أو BTC / US100 / US30 / OIL / EURUSD ...)\n"
-    "/scan  (TOP 3 إشارات)\n"
+    "/analyze XAU  (أو BTC / US100 / US30 / OIL / GER40CASH / BRENTCASH ...)\n"
+    "/scan  (TOP إشارات)\n"
     "/daily (الحصيلة اليومية)\n"
     "/pause  |  /resume\n"
 )
@@ -891,8 +909,6 @@ ALIASES = {
     "/eurusd": "EURUSD",
     "/gbpusd": "GBPUSD",
     "/usdjpy": "USDJPY",
-
-    # ✅ New shortcuts
     "/ger40": "GER40CASH",
     "/brent": "BRENTCASH",
 }
@@ -934,8 +950,8 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"MODE={MODE}\nCHECK_INTERVAL_SEC={CHECK_INTERVAL_SEC}\nCOOLDOWN_MINUTES={COOLDOWN_MINUTES}\n"
             f"RETEST_ATR={RETEST_ATR}\nMAX_PENDING_DISTANCE_ATR={MAX_PENDING_DISTANCE_ATR}\n"
             f"SL_BUFFER_ATR={SL_BUFFER_ATR}\nMAX_ATR_PCT={MAX_ATR_PCT}\n"
-            f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
-            f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
+            f"SMART_ENTRY={int(SMART_ENTRY)} | MARKET_ATR_MAX={MARKET_ATR_MAX}\n"
+            f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\nMIN_CONF_SCAN={MIN_CONF_SCAN}\n"
             f"DAILY_REPORT_UTC={DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d}\n"
             f"RISK_PCT={RISK_PCT}\nPAUSED={state.get('paused', False)}"
         )
@@ -994,21 +1010,18 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         if not tg_send_photo(chat_id, caption, img):
             tg_send_message(chat_id, caption)
 
-        # ✅ daily tracking
         register_trade_for_daily(state, plan)
         save_state(state)
         return
 
     if cmd == "/scan":
         plans: List[Tuple[int, Plan]] = []
-
         for k, sym in SYMBOLS.items():
             p = build_plan(k, sym)
             if p is None:
                 continue
             if p.confidence < MIN_CONF_SCAN:
                 continue
-
             score = p.confidence + (1 if p.liq else 0) + (1 if p.bos else 0)
             plans.append((score, p))
 
@@ -1030,10 +1043,8 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             if not tg_send_photo(chat_id, caption, img):
                 tg_send_message(chat_id, caption)
 
-            # ✅ daily tracking
             register_trade_for_daily(state, plan)
             save_state(state)
-
             time.sleep(1)
         return
 
@@ -1054,15 +1065,15 @@ def main():
         logger.info("Bot username: @%s", bot_username)
 
     state = load_state()
-    logger.info("VIP bot started. MODE=%s | CHAT_ID=%s", MODE, CHAT_ID)
+    logger.info("VIP bot started. MODE=%s | SMART_ENTRY=%s | CHAT_ID=%s", MODE, int(SMART_ENTRY), CHAT_ID)
 
-    tg_send_message(CHAT_ID, "✅ VIP Bot Online (VIP M30 + Liq/BOS + TOP scan + Daily). اكتب /help")
+    tg_send_message(CHAT_ID, "✅ VIP Bot Online (M30 + Liq/BOS + Smart Entry + Daily). اكتب /help")
 
     last_check = 0.0
 
     while True:
         try:
-            # ✅ update outcomes + daily report
+            # update outcomes + daily report
             update_trade_outcomes(state)
             maybe_send_daily_report(state)
 
@@ -1106,10 +1117,7 @@ def main():
                     tg_send_message(CHAT_ID, caption)
 
                 mark_sent(state, plan)
-
-                # ✅ daily tracking
                 register_trade_for_daily(state, plan)
-
                 save_state(state)
                 time.sleep(1)
 
