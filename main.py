@@ -66,7 +66,7 @@ STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
 # Liquidity + BOS
 USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
-MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "8"))  # أقوى من 7
+MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "8"))
 
 # Daily report (UTC)
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))
@@ -86,7 +86,7 @@ CRYPTO_LABELS = {"BTC", "ETH"}
 
 # Smart Entry
 SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
-MARKET_ATR_MAX = float(os.getenv("MARKET_ATR_MAX", "0.25"))  # أقوى من 0.35
+MARKET_ATR_MAX = float(os.getenv("MARKET_ATR_MAX", "0.25"))
 LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
 
 
@@ -130,7 +130,7 @@ TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
 # =========================
-# SESSION FILTER HELPERS
+# SESSION / MARKET FILTERS
 # =========================
 def is_crypto_label(label: str) -> bool:
     return label.upper() in CRYPTO_LABELS
@@ -150,6 +150,26 @@ def session_allowed_for_symbol(label: str) -> bool:
     now = time.gmtime()
     hour = now.tm_hour
     return SESSION_START_UTC <= hour < SESSION_END_UTC
+
+
+def is_weekend_utc() -> bool:
+    # Monday=0 ... Sunday=6
+    wd = time.gmtime().tm_wday
+    return wd in (5, 6)  # Saturday, Sunday
+
+
+def market_is_open_for_symbol(label: str) -> bool:
+    """
+    Crypto: always open
+    Forex / indices / metals / oil: closed on weekend
+    """
+    if is_crypto_label(label):
+        return True
+
+    if is_weekend_utc():
+        return False
+
+    return True
 
 
 # =========================
@@ -530,7 +550,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     mid = (zone_low + zone_high) / 2.0
     dist_atr = abs(px - mid) / (a + 1e-9)
 
-    # Smart Entry Decision
     entry_type = "LIMIT"
     entry = mid
 
@@ -959,6 +978,7 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"SMART_ENTRY={int(SMART_ENTRY)} | MARKET_ATR_MAX={MARKET_ATR_MAX}\n"
             f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
             f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
+            f"WEEKEND_FILTER=1\n"
             f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
             f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
             f"DAILY_REPORT_UTC={DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d}\n"
@@ -1004,6 +1024,10 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             tg_send_message(chat_id, "❌ الرمز غير معروف. جرّب /symbols")
             return
 
+        if not market_is_open_for_symbol(sym_key):
+            tg_send_message(chat_id, f"🚫 السوق مغلق الآن لـ {sym_key}.")
+            return
+
         if not session_allowed_for_symbol(sym_key):
             tg_send_message(chat_id, f"⏰ {sym_key} خارج جلسة التداول المسموح بها الآن.")
             return
@@ -1031,6 +1055,8 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         plans: List[Tuple[int, Plan]] = []
 
         for k, sym in SYMBOLS.items():
+            if not market_is_open_for_symbol(k):
+                continue
             if not session_allowed_for_symbol(k):
                 continue
 
@@ -1088,7 +1114,7 @@ def main():
         MODE, int(SMART_ENTRY), int(USE_SESSION_FILTER), CHAT_ID
     )
 
-    tg_send_message(CHAT_ID, "✅ VIP Bot Online (Stronger VIP + Smart Entry + Smart Session + Daily). اكتب /help")
+    tg_send_message(CHAT_ID, "✅ VIP Bot Online (Stronger VIP + Smart Entry + Smart Session + Weekend Filter + Daily). اكتب /help")
 
     last_check = 0.0
 
@@ -1118,6 +1144,8 @@ def main():
             last_check = now
 
             for label, sym in SYMBOLS.items():
+                if not market_is_open_for_symbol(label):
+                    continue
                 if not session_allowed_for_symbol(label):
                     continue
 
