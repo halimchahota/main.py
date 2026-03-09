@@ -1,833 +1,1261 @@
+# -*- coding: utf-8 -*-
 import os
+import io
 import time
 import json
-import math
+import hashlib
 import logging
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, List
 
 import requests
-import pytz
+import pandas as pd
+import yfinance as yf
 
-# =========================================
-# CONFIG
-# =========================================
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("vip_bot")
+
+
+# =========================
+# ENV / CONFIG
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
-RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))  # الافتراضي 1%
-STATE_FILE = os.getenv("STATE_FILE", "ghost_bot_state.json")
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
+RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
-REQUEST_TIMEOUT = 10
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
-SYMBOLS = {
-    "US100": "NQ=F",
-    "US30": "^DJI",
-    "BTC": "BTC-USD",
-    "XAU": "GC=F",
+MODE = os.getenv("MODE", "vip_retest").strip().lower()  # vip_retest | vip_mix
+
+RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))
+MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))
+MARKET_ATR_MAX = float(os.getenv("MARKET_ATR_MAX", "0.25"))
+SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
+
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+UPDATES_TIMEOUT = 30
+
+EMA_FAST = int(os.getenv("EMA_FAST", "20"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
+
+LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "90d")
+LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "60d")
+LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "15d")
+
+STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
+
+USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
+VIP_FILTER_PRO = os.getenv("VIP_FILTER_PRO", "1").strip() == "1"
+SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
+LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
+
+SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
+MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "8"))
+
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))
+
+USE_SESSION_FILTER = os.getenv("USE_SESSION_FILTER", "0").strip() == "1"
+SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
+SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
+
+CRYPTO_LABELS = {"BTC"}
+
+
+# =========================
+# SYMBOLS
+# =========================
+SYMBOLS: Dict[str, str] = {
+    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
+    "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
+    "US100": os.getenv("US100_SYMBOL", "NQ=F"),
+    "US30": os.getenv("US30_SYMBOL", "^DJI"),
+    "GER40": os.getenv("GER40_SYMBOL", "^GDAXI"),
+    "OILCASH": os.getenv("OILCASH_SYMBOL", "CL=F"),
+    "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
+    "EURUSD": os.getenv("EURUSD_SYMBOL", "EURUSD=X"),
+    "USDJPY": os.getenv("USDJPY_SYMBOL", "USDJPY=X"),
 }
 
-# =========================================
-# LOGGING
-# =========================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger("ghost_bot")
+TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
-# =========================================
-# TELEGRAM
-# =========================================
-def send_telegram_message(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        logger.warning("BOT_TOKEN or CHAT_ID missing.")
-        return
+# =========================
+# SESSION / MARKET FILTERS
+# =========================
+def is_crypto_label(label: str) -> bool:
+    return label.upper() in CRYPTO_LABELS
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
+
+def is_asia_allowed_label(label: str) -> bool:
+    asia_allowed = {
+        "XAU",
+        "XAG",
+        "US100",
+        "US30",
+        "GER40",
+        "OILCASH",
     }
+    return label.upper() in asia_allowed
 
+
+def session_allowed_for_symbol(label: str) -> bool:
+    """
+    Crypto: 24/7
+    Gold + Silver + indices + oil: allowed in Asia too
+    Forex: London + New York only
+    When USE_SESSION_FILTER=0 => all sessions
+    """
+    if not USE_SESSION_FILTER:
+        return True
+
+    if is_crypto_label(label):
+        return True
+
+    if is_asia_allowed_label(label):
+        return True
+
+    hour = time.gmtime().tm_hour
+    return SESSION_START_UTC <= hour < SESSION_END_UTC
+
+
+def is_weekend_utc() -> bool:
+    wd = time.gmtime().tm_wday  # Monday=0 ... Sunday=6
+    return wd in (5, 6)  # Saturday, Sunday
+
+
+def market_is_open_for_symbol(label: str) -> bool:
+    """
+    Crypto: always open
+    All non-crypto: closed on weekend
+    """
+    if is_crypto_label(label):
+        return True
+    return not is_weekend_utc()
+
+
+# =========================
+# PRICE FORMAT
+# =========================
+def price_decimals(label: str, px: float) -> int:
+    label = (label or "").upper()
+    if "JPY" in label:
+        return 3
+
+    fx_5 = {
+        "EURUSD", "GBPUSD", "AUDUSD", "USDCHF", "USDCAD", "NZDUSD",
+        "EURGBP", "EURCHF", "EURAUD", "EURCAD", "GBPCHF"
+    }
+    if label in fx_5:
+        return 5
+
+    if label in ("BTC", "ETH"):
+        return 2
+
+    if label in ("XAU", "XAG"):
+        return 2
+
+    return 2 if abs(px) >= 100 else 5
+
+
+def fmt_price(label: str, x: float, px_hint: float) -> str:
+    return f"{x:.{price_decimals(label, px_hint)}f}"
+
+
+# =========================
+# STATE
+# =========================
+def _utc_date_str(ts: Optional[float] = None) -> str:
+    ts = ts if ts is not None else time.time()
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def load_state() -> dict:
     try:
-        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if response.status_code != 200:
-            logger.error("Telegram error: %s", response.text)
+        if os.path.exists(STATE_PATH):
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                st = json.load(f)
+                st.setdefault("last_sent", {})
+                st.setdefault("tg_offset", 0)
+                st.setdefault("paused", False)
+                st.setdefault("open_trades", {})
+                st.setdefault("daily", {})
+                st.setdefault("last_report_date", "")
+                return st
     except Exception as e:
-        logger.exception("Failed to send telegram message: %s", e)
+        logger.warning("Failed to load state: %s", e)
 
-
-# =========================================
-# STATE MANAGEMENT
-# =========================================
-def default_state() -> Dict:
     return {
-        "date": datetime.utcnow().strftime("%Y-%m-%d"),
-        "daily_stats": {
-            "losses_in_row": 0,
-            "daily_pnl_pct": 0.0,
-            "trading_paused": False,
-            "signals_sent_today": 0
-        },
-        "open_positions": [],
-        "closed_alerts": []
+        "last_sent": {},
+        "tg_offset": 0,
+        "paused": False,
+        "open_trades": {},
+        "daily": {},
+        "last_report_date": "",
     }
 
 
-def load_state() -> Dict:
-    if not os.path.exists(STATE_FILE):
-        return default_state()
-
+def save_state(state: dict) -> None:
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-            return state
-    except Exception as e:
-        logger.exception("Error loading state: %s", e)
-        return default_state()
-
-
-def save_state(state: Dict) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.exception("Error saving state: %s", e)
+        logger.warning("Failed to save state: %s", e)
 
 
-def reset_daily_state_if_needed(state: Dict) -> Dict:
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if state.get("date") != today:
-        state["date"] = today
-        state["daily_stats"] = {
-            "losses_in_row": 0,
-            "daily_pnl_pct": 0.0,
-            "trading_paused": False,
-            "signals_sent_today": 0
-        }
-    return state
+# =========================
+# TELEGRAM
+# =========================
+def tg_url(method: str) -> str:
+    return TELEGRAM_BASE.format(token=BOT_TOKEN, method=method)
 
 
-# =========================================
-# HELPERS
-# =========================================
-def round2(x: float) -> float:
-    return round(float(x), 2)
-
-
-def safe_float(x, default=0.0) -> float:
+def tg_delete_webhook() -> None:
     try:
-        return float(x)
-    except Exception:
-        return float(default)
-
-
-def in_range(value: float, low: float, high: float) -> bool:
-    return low <= value <= high
-
-
-def percent_distance(a: float, b: float) -> float:
-    if a == 0:
-        return 0.0
-    return abs(a - b) / abs(a)
-
-
-# =========================================
-# CANDLE / STRUCTURE LOGIC
-# =========================================
-def candle_body(candle: Dict) -> float:
-    return abs(candle["close"] - candle["open"])
-
-
-def upper_wick(candle: Dict) -> float:
-    return candle["high"] - max(candle["open"], candle["close"])
-
-
-def lower_wick(candle: Dict) -> float:
-    return min(candle["open"], candle["close"]) - candle["low"]
-
-
-def bearish_rejection_candle(candle: Dict) -> bool:
-    body = candle_body(candle)
-    uw = upper_wick(candle)
-    lw = lower_wick(candle)
-
-    if body <= 0:
-        return False
-
-    return candle["close"] < candle["open"] and uw > body * 1.2 and uw > lw
-
-
-def bullish_rejection_candle(candle: Dict) -> bool:
-    body = candle_body(candle)
-    uw = upper_wick(candle)
-    lw = lower_wick(candle)
-
-    if body <= 0:
-        return False
-
-    return candle["close"] > candle["open"] and lw > body * 1.2 and lw > uw
-
-
-def bearish_engulfing(prev_candle: Dict, candle: Dict) -> bool:
-    return (
-        prev_candle["close"] > prev_candle["open"]
-        and candle["close"] < candle["open"]
-        and candle["open"] >= prev_candle["close"]
-        and candle["close"] <= prev_candle["open"]
-    )
-
-
-def bullish_engulfing(prev_candle: Dict, candle: Dict) -> bool:
-    return (
-        prev_candle["close"] < prev_candle["open"]
-        and candle["close"] > candle["open"]
-        and candle["open"] <= prev_candle["close"]
-        and candle["close"] >= prev_candle["open"]
-    )
-
-
-def swept_liquidity_up(recent_highs: List[float], current_high: float) -> bool:
-    if not recent_highs:
-        return False
-    return current_high > max(recent_highs)
-
-
-def swept_liquidity_down(recent_lows: List[float], current_low: float) -> bool:
-    if not recent_lows:
-        return False
-    return current_low < min(recent_lows)
-
-
-def broke_structure_bearish(last_swing_low: float, current_close: float) -> bool:
-    return current_close < last_swing_low
-
-
-def broke_structure_bullish(last_swing_high: float, current_close: float) -> bool:
-    return current_close > last_swing_high
-
-
-# =========================================
-# TREND / ATR / SESSION FILTERS
-# =========================================
-def is_bearish_trend(d1_trend: int, h4_trend: int) -> bool:
-    return d1_trend < 0 and h4_trend < 0
-
-
-def is_bullish_trend(d1_trend: int, h4_trend: int) -> bool:
-    return d1_trend > 0 and h4_trend > 0
-
-
-def atr_filter(atr_value: float, price: float, min_pct=0.0015, max_pct=0.008) -> bool:
-    if price <= 0:
-        return False
-    atr_pct = atr_value / price
-    return min_pct <= atr_pct <= max_pct
-
-
-def is_ny_session() -> bool:
-    ny_tz = pytz.timezone("America/New_York")
-    now_ny = datetime.now(ny_tz)
-
-    # من 9:30 إلى 12:59 تقريبًا
-    if now_ny.hour == 9 and now_ny.minute >= 30:
-        return True
-    if 10 <= now_ny.hour <= 12:
-        return True
-    return False
-
-
-# =========================================
-# CORRELATION / RISK CONTROLS
-# =========================================
-def correlated_assets_block(symbol: str, open_positions: List[Dict]) -> bool:
-    correlated_groups = [
-        {"US100", "US30"}
-    ]
-
-    for group in correlated_groups:
-        if symbol in group:
-            for pos in open_positions:
-                if pos["status"] == "OPEN" and pos["symbol"] in group:
-                    return True
-    return False
-
-
-def calculate_position_size(balance: float, risk_pct: float, entry: float, stop: float) -> float:
-    risk_amount = balance * (risk_pct / 100.0)
-    stop_distance = abs(entry - stop)
-
-    if stop_distance <= 0:
-        return 0.0
-
-    size = risk_amount / stop_distance
-    return round(size, 4)
-
-
-# =========================================
-# ENTRY VALIDATION
-# =========================================
-def valid_sell_entry(data: Dict) -> Tuple[bool, str]:
-    price = data["price"]
-    zone_low = data["zone_low"]
-    zone_high = data["zone_high"]
-    d1_trend = data["d1_trend"]
-    h4_trend = data["h4_trend"]
-    m15_trend = data["m15_trend"]
-    confirm_candle = data["confirm_candle"]
-    prev_candle = data["prev_candle"]
-    recent_highs = data["recent_highs"]
-    last_swing_low = data["last_swing_low"]
-    current_high = data["current_high"]
-    current_close = data["current_close"]
-    atr = data["atr"]
-
-    if not is_ny_session():
-        return False, "Outside NY session"
-
-    if not is_bearish_trend(d1_trend, h4_trend):
-        return False, "D1/H4 not bearish"
-
-    if m15_trend > 0:
-        return False, "M15 still bullish"
-
-    if not in_range(price, zone_low, zone_high):
-        return False, "Price not inside sell zone"
-
-    if not atr_filter(atr, price):
-        return False, "ATR filter failed"
-
-    liq = swept_liquidity_up(recent_highs, current_high)
-    rej = bearish_rejection_candle(confirm_candle) or bearish_engulfing(prev_candle, confirm_candle)
-    bos = broke_structure_bearish(last_swing_low, current_close)
-
-    if not liq:
-        return False, "No liquidity sweep"
-    if not rej:
-        return False, "No bearish rejection candle"
-    if not bos:
-        return False, "No bearish BOS"
-
-    return True, "Valid SELL setup"
-
-
-def valid_buy_entry(data: Dict) -> Tuple[bool, str]:
-    price = data["price"]
-    zone_low = data["zone_low"]
-    zone_high = data["zone_high"]
-    d1_trend = data["d1_trend"]
-    h4_trend = data["h4_trend"]
-    m15_trend = data["m15_trend"]
-    confirm_candle = data["confirm_candle"]
-    prev_candle = data["prev_candle"]
-    recent_lows = data["recent_lows"]
-    last_swing_high = data["last_swing_high"]
-    current_low = data["current_low"]
-    current_close = data["current_close"]
-    atr = data["atr"]
-
-    if not is_ny_session():
-        return False, "Outside NY session"
-
-    if not is_bullish_trend(d1_trend, h4_trend):
-        return False, "D1/H4 not bullish"
-
-    if m15_trend < 0:
-        return False, "M15 still bearish"
-
-    if not in_range(price, zone_low, zone_high):
-        return False, "Price not inside buy zone"
-
-    if not atr_filter(atr, price):
-        return False, "ATR filter failed"
-
-    liq = swept_liquidity_down(recent_lows, current_low)
-    rej = bullish_rejection_candle(confirm_candle) or bullish_engulfing(prev_candle, confirm_candle)
-    bos = broke_structure_bullish(last_swing_high, current_close)
-
-    if not liq:
-        return False, "No liquidity sweep"
-    if not rej:
-        return False, "No bullish rejection candle"
-    if not bos:
-        return False, "No bullish BOS"
-
-    return True, "Valid BUY setup"
-
-
-# =========================================
-# EXIT / CLOSE LOGIC
-# =========================================
-def classify_exit_signal(reversal_candle: bool, bos: bool, trend_flip: bool) -> str:
-    score = 0
-    if reversal_candle:
-        score += 1
-    if bos:
-        score += 2
-    if trend_flip:
-        score += 2
-
-    if score >= 4:
-        return "FULL_EXIT"
-    if score >= 2:
-        return "CLOSE_ALERT"
-    return "HOLD"
-
-
-def should_close_sell_trade(position: Dict, data: Dict) -> Tuple[bool, str, str]:
-    current_candle = data["confirm_candle"]
-    current_close = data["current_close"]
-    last_swing_high = data["last_swing_high"]
-    h4_trend = data["h4_trend"]
-    m15_trend = data["m15_trend"]
-    bars_since_entry = data.get("bars_since_entry", 0)
-    reached_tp1 = data.get("reached_tp1", False)
-
-    reversal_candle = bullish_rejection_candle(current_candle)
-    bos_bullish = broke_structure_bullish(last_swing_high, current_close)
-    trend_flip = h4_trend > 0 and m15_trend > 0
-
-    exit_type = classify_exit_signal(reversal_candle, bos_bullish, trend_flip)
-
-    if bars_since_entry >= 8 and not reached_tp1 and reversal_candle:
-        return True, "Time-based weakness against SELL", "CLOSE_ALERT"
-
-    if exit_type == "FULL_EXIT":
-        return True, "Bullish reversal + bullish BOS + trend flip", "FULL_EXIT"
-
-    if exit_type == "CLOSE_ALERT":
-        return True, "Possible bullish reversal against SELL", "CLOSE_ALERT"
-
-    return False, "No close condition", "HOLD"
-
-
-def should_close_buy_trade(position: Dict, data: Dict) -> Tuple[bool, str, str]:
-    current_candle = data["confirm_candle"]
-    current_close = data["current_close"]
-    last_swing_low = data["last_swing_low"]
-    h4_trend = data["h4_trend"]
-    m15_trend = data["m15_trend"]
-    bars_since_entry = data.get("bars_since_entry", 0)
-    reached_tp1 = data.get("reached_tp1", False)
-
-    reversal_candle = bearish_rejection_candle(current_candle)
-    bos_bearish = broke_structure_bearish(last_swing_low, current_close)
-    trend_flip = h4_trend < 0 and m15_trend < 0
-
-    exit_type = classify_exit_signal(reversal_candle, bos_bearish, trend_flip)
-
-    if bars_since_entry >= 8 and not reached_tp1 and reversal_candle:
-        return True, "Time-based weakness against BUY", "CLOSE_ALERT"
-
-    if exit_type == "FULL_EXIT":
-        return True, "Bearish reversal + bearish BOS + trend flip", "FULL_EXIT"
-
-    if exit_type == "CLOSE_ALERT":
-        return True, "Possible bearish reversal against BUY", "CLOSE_ALERT"
-
-    return False, "No close condition", "HOLD"
-
-
-# =========================================
-# MESSAGE BUILDERS
-# =========================================
-def build_entry_message(position: Dict) -> str:
-    side_icon = "🔴" if position["side"] == "SELL" else "🟢"
-
-    return (
-        f"<b>بوت الشبح المطور 👻</b>\n"
-        f"{position['symbol']}\n\n"
-        f"{side_icon} <b>{position['side']} CONFIRMED</b>\n"
-        f"Entry: <b>{position['entry']}</b>\n"
-        f"SL: <b>{position['sl']}</b>\n"
-        f"TP1: <b>{position['tp1']}</b>\n"
-        f"TP2: <b>{position['tp2']}</b>\n"
-        f"TP3: <b>{position['tp3']}</b>\n"
-        f"Zone: [{position['zone_low']} - {position['zone_high']}]\n"
-        f"Confidence: <b>{position['confidence']}/10</b>\n"
-        f"Reason: {position['reason']}"
-    )
-
-
-def build_close_message(position: Dict, current_price: float, reason: str, exit_type: str) -> str:
-    icon = "⚠️" if exit_type == "CLOSE_ALERT" else "⛔"
-
-    return (
-        f"<b>بوت الشبح - {exit_type}</b>\n"
-        f"{position['symbol']}\n\n"
-        f"{icon} <b>{exit_type}</b>\n"
-        f"Side: <b>{position['side']}</b>\n"
-        f"Entry: <b>{position['entry']}</b>\n"
-        f"Current: <b>{round2(current_price)}</b>\n"
-        f"SL: <b>{position['sl']}</b>\n"
-        f"Reason: {reason}"
-    )
-
-
-# =========================================
-# TRADE / DAILY STATS
-# =========================================
-def update_after_closed_trade(state: Dict, pnl_pct: float) -> None:
-    stats = state["daily_stats"]
-    stats["daily_pnl_pct"] += pnl_pct
-
-    if pnl_pct < 0:
-        stats["losses_in_row"] += 1
-    else:
-        stats["losses_in_row"] = 0
-
-    if stats["losses_in_row"] >= 2 or stats["daily_pnl_pct"] <= -4.0:
-        stats["trading_paused"] = True
-        send_telegram_message(
-            "🛑 <b>تم إيقاف التداول لبقية اليوم</b>\n"
-            "السبب: حد الخسائر اليومية أو خسارتين متتاليتين."
+        r = requests.get(
+            tg_url("deleteWebhook"),
+            params={"drop_pending_updates": False},
+            timeout=REQUEST_TIMEOUT,
         )
+        if r.ok:
+            logger.info("deleteWebhook OK")
+        else:
+            logger.warning("deleteWebhook failed: %s | %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logger.warning("deleteWebhook error: %s", e)
 
 
-# =========================================
-# POSITION TRACKING
-# =========================================
-def create_position(symbol: str, side: str, data: Dict, account_balance: float) -> Dict:
-    entry = round2(data["entry"])
-    sl = round2(data["sl"])
-    tp1 = round2(data["tp1"])
-    tp2 = round2(data["tp2"])
-    tp3 = round2(data["tp3"])
-
-    size = calculate_position_size(account_balance, RISK_PCT, entry, sl)
-
-    return {
-        "id": f"{symbol}_{side}_{int(time.time())}",
-        "symbol": symbol,
-        "side": side,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "zone_low": round2(data["zone_low"]),
-        "zone_high": round2(data["zone_high"]),
-        "confidence": data.get("confidence", 8),
-        "reason": data.get("reason", "Confirmed setup"),
-        "size": size,
-        "status": "OPEN",
-        "created_at": datetime.utcnow().isoformat(),
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "tp3_hit": False,
-        "close_alert_sent": False,
-        "full_exit_sent": False
-    }
+def tg_get_me() -> Optional[dict]:
+    try:
+        r = requests.get(tg_url("getMe"), timeout=REQUEST_TIMEOUT)
+        if not r.ok:
+            return None
+        return r.json().get("result")
+    except Exception:
+        return None
 
 
-def process_position_targets(position: Dict, current_price: float) -> Optional[float]:
+def tg_send_message(chat_id: str, text: str) -> bool:
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "text": text[:4096],
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(tg_url("sendMessage"), json=payload, timeout=REQUEST_TIMEOUT)
+        if not r.ok:
+            logger.error("sendMessage failed: %s | %s", r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception as e:
+        logger.error("sendMessage error: %s", e)
+        return False
+
+
+def tg_send_photo(chat_id: str, caption: str, image_bytes: bytes) -> bool:
+    try:
+        files = {"photo": ("chart.png", image_bytes, "image/png")}
+        data = {"chat_id": chat_id, "caption": (caption or "")[:1000]}
+        r = requests.post(tg_url("sendPhoto"), data=data, files=files, timeout=REQUEST_TIMEOUT)
+        if not r.ok:
+            logger.error("sendPhoto failed: %s | %s", r.status_code, r.text[:300])
+            return False
+        return True
+    except Exception as e:
+        logger.error("sendPhoto error: %s", e)
+        return False
+
+
+def tg_get_updates(offset: int) -> dict:
+    try:
+        params = {
+            "timeout": UPDATES_TIMEOUT,
+            "offset": offset,
+            "allowed_updates": json.dumps(["message", "channel_post"]),
+        }
+        r = requests.get(tg_url("getUpdates"), params=params, timeout=UPDATES_TIMEOUT + 10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error("getUpdates error: %s", e)
+        return {"ok": False, "result": []}
+
+
+# =========================
+# MARKET DATA
+# =========================
+def yf_download_safe(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    try:
+        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+
+        needed = {"Open", "High", "Low", "Close"}
+        if not needed.issubset(df.columns):
+            return None
+
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        if df.empty:
+            return None
+        return df
+    except Exception as e:
+        logger.error("yfinance failed %s %s %s: %s", symbol, period, interval, e)
+        return None
+
+
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
+
+
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    h = df["High"]
+    l = df["Low"]
+    c = df["Close"]
+    prev = c.shift(1)
+    tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+
+def last_price(df: pd.DataFrame) -> float:
+    return float(df["Close"].iloc[-1])
+
+
+def trend_score(df: pd.DataFrame) -> int:
+    c = df["Close"]
+    if len(c) < max(EMA_FAST, EMA_SLOW) + 10:
+        return 0
+
+    f = ema(c, EMA_FAST)
+    s = ema(c, EMA_SLOW)
+    slope = (f.iloc[-1] - f.iloc[-6]) / (abs(f.iloc[-6]) + 1e-9)
+
+    if f.iloc[-1] > s.iloc[-1] and slope > 0:
+        return +1
+    if f.iloc[-1] < s.iloc[-1] and slope < 0:
+        return -1
+    return 0
+
+
+# =========================
+# SMART MONEY DETECTION
+# =========================
+def detect_liq_sweep_side(df: pd.DataFrame, a: float) -> Optional[str]:
     """
-    يرجع pnl تقريبي عند الإغلاق النهائي فقط.
+    BUY = sweep low then close back above prior lows
+    SELL = sweep high then close back below prior highs
     """
+    if df is None or len(df) < 60 or a <= 0:
+        return None
 
-    if position["side"] == "BUY":
-        if current_price >= position["tp1"] and not position["tp1_hit"]:
-            position["tp1_hit"] = True
-            send_telegram_message(
-                f"✅ <b>{position['symbol']}</b>\n"
-                f"TP1 HIT\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
+    d = df.tail(80).copy()
+    hi20 = float(d["High"].iloc[-21:-1].max())
+    lo20 = float(d["Low"].iloc[-21:-1].min())
+    last_h = float(d["High"].iloc[-1])
+    last_l = float(d["Low"].iloc[-1])
+    last_c = float(d["Close"].iloc[-1])
 
-        if current_price >= position["tp2"] and not position["tp2_hit"]:
-            position["tp2_hit"] = True
-            send_telegram_message(
-                f"✅ <b>{position['symbol']}</b>\n"
-                f"TP2 HIT\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
-
-        if current_price >= position["tp3"] and not position["tp3_hit"]:
-            position["tp3_hit"] = True
-            position["status"] = "CLOSED"
-            send_telegram_message(
-                f"🏁 <b>{position['symbol']}</b>\n"
-                f"TP3 HIT - TRADE CLOSED\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
-            return 3.0
-
-        if current_price <= position["sl"]:
-            position["status"] = "CLOSED"
-            send_telegram_message(
-                f"❌ <b>{position['symbol']}</b>\n"
-                f"SL HIT - TRADE CLOSED\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
-            return -float(RISK_PCT)
-
-    elif position["side"] == "SELL":
-        if current_price <= position["tp1"] and not position["tp1_hit"]:
-            position["tp1_hit"] = True
-            send_telegram_message(
-                f"✅ <b>{position['symbol']}</b>\n"
-                f"TP1 HIT\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
-
-        if current_price <= position["tp2"] and not position["tp2_hit"]:
-            position["tp2_hit"] = True
-            send_telegram_message(
-                f"✅ <b>{position['symbol']}</b>\n"
-                f"TP2 HIT\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
-
-        if current_price <= position["tp3"] and not position["tp3_hit"]:
-            position["tp3_hit"] = True
-            position["status"] = "CLOSED"
-            send_telegram_message(
-                f"🏁 <b>{position['symbol']}</b>\n"
-                f"TP3 HIT - TRADE CLOSED\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
-            return 3.0
-
-        if current_price >= position["sl"]:
-            position["status"] = "CLOSED"
-            send_telegram_message(
-                f"❌ <b>{position['symbol']}</b>\n"
-                f"SL HIT - TRADE CLOSED\n"
-                f"Side: {position['side']}\n"
-                f"Price: {round2(current_price)}"
-            )
-            return -float(RISK_PCT)
-
+    if (last_l < lo20 - 0.05 * a) and (last_c > lo20):
+        return "BUY"
+    if (last_h > hi20 + 0.05 * a) and (last_c < hi20):
+        return "SELL"
     return None
 
 
-def monitor_open_positions(state: Dict, market_data: Dict[str, Dict]) -> None:
-    for position in state["open_positions"]:
-        if position["status"] != "OPEN":
+def detect_bos_side(df: pd.DataFrame) -> Optional[str]:
+    """
+    BUY = close breaks prior swing high
+    SELL = close breaks prior swing low
+    """
+    if df is None or len(df) < 60:
+        return None
+
+    d = df.tail(80).copy()
+    swing_high = float(d["High"].iloc[-21:-2].max())
+    swing_low = float(d["Low"].iloc[-21:-2].min())
+    last_c = float(d["Close"].iloc[-1])
+
+    if last_c > swing_high:
+        return "BUY"
+    if last_c < swing_low:
+        return "SELL"
+    return None
+
+
+def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
+    if len(df) < 60:
+        return None
+
+    d = df.tail(90).copy()
+    a = atr(d, 14).iloc[-1]
+    if a is None or pd.isna(a) or a <= 0:
+        return None
+    a = float(a)
+
+    o = d["Open"].values
+    c = d["Close"].values
+    h = d["High"].values
+    l = d["Low"].values
+
+    for i in range(len(d) - 10, 10, -1):
+        body = abs(c[i] - o[i])
+        if body < 0.8 * a:
             continue
 
-        symbol = position["symbol"]
-        if symbol not in market_data:
-            continue
-
-        data = market_data[symbol]
-        current_price = data["price"]
-
-        # 1) فحص الأهداف والوقف
-        pnl_result = process_position_targets(position, current_price)
-        if pnl_result is not None:
-            update_after_closed_trade(state, pnl_result)
-            continue
-
-        # 2) فحص انعكاس الصفقة
-        if position["side"] == "SELL":
-            close_now, reason, exit_type = should_close_sell_trade(position, data)
+        if direction == "BUY":
+            if c[i] > o[i] and c[i] > h[i - 1] and c[i - 1] < o[i - 1]:
+                return float(l[i - 1]), float(h[i - 1])
         else:
-            close_now, reason, exit_type = should_close_buy_trade(position, data)
-
-        if not close_now:
-            continue
-
-        if exit_type == "CLOSE_ALERT" and not position["close_alert_sent"]:
-            send_telegram_message(build_close_message(position, current_price, reason, exit_type))
-            position["close_alert_sent"] = True
-
-        if exit_type == "FULL_EXIT" and not position["full_exit_sent"]:
-            send_telegram_message(build_close_message(position, current_price, reason, exit_type))
-            position["full_exit_sent"] = True
+            if c[i] < o[i] and c[i] < l[i - 1] and c[i - 1] > o[i - 1]:
+                return float(l[i - 1]), float(h[i - 1])
+    return None
 
 
-# =========================================
-# SIGNAL SCAN
-# =========================================
-def should_send_signal(state: Dict, symbol: str, data: Dict) -> Tuple[bool, str, Optional[str]]:
-    stats = state["daily_stats"]
+def find_fvg(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
+    if len(df) < 60:
+        return None
 
-    if stats["trading_paused"]:
-        return False, "Trading paused", None
+    d = df.tail(160).copy().reset_index(drop=True)
+    px = float(d["Close"].iloc[-1])
 
-    if stats["signals_sent_today"] >= 2:
-        return False, "Daily signal limit reached", None
+    zones = []
+    for i in range(2, len(d) - 2):
+        h_prev2 = float(d.loc[i - 2, "High"])
+        l_prev2 = float(d.loc[i - 2, "Low"])
+        h_i = float(d.loc[i, "High"])
+        l_i = float(d.loc[i, "Low"])
 
-    if correlated_assets_block(symbol, state["open_positions"]):
-        return False, "Correlated asset already open", None
+        if direction == "BUY":
+            if l_i > h_prev2:
+                zones.append((h_prev2, l_i))
+        else:
+            if h_i < l_prev2:
+                zones.append((h_i, l_prev2))
 
-    side = data.get("side", "").upper()
+    if not zones:
+        return None
 
-    if side == "SELL":
-        ok, reason = valid_sell_entry(data)
-        return ok, reason, "SELL" if ok else None
+    best = None
+    best_d = 1e18
+    for z0, z1 in zones[-25:]:
+        mid = (z0 + z1) / 2.0
+        dist = abs(px - mid)
+        if dist < best_d:
+            best_d = dist
+            best = (float(min(z0, z1)), float(max(z0, z1)))
+    return best
+
+
+# =========================
+# PLAN
+# =========================
+@dataclass
+class Plan:
+    label: str
+    symbol: str
+    timeframe: str
+    trend_d1: int
+    trend_h4: int
+    overall: int
+    side: str
+    entry_type: str
+    entry: float
+    sl: float
+    tp1: float
+    tp2: float
+    tp3: float
+    zone_name: str
+    zone_low: Optional[float]
+    zone_high: Optional[float]
+    atr_value: float
+    confidence: int
+    risk_usd: float
+    liq_side: Optional[str]
+    bos_side: Optional[str]
+
+
+def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
+    r = abs(entry - sl)
+    r = max(r, 1e-9)
+    if side == "BUY":
+        return entry + 1 * r, entry + 2 * r, entry + 3 * r
+    return entry - 1 * r, entry - 2 * r, entry - 3 * r
+
+
+def build_plan(label: str, symbol: str) -> Optional[Plan]:
+    d1 = yf_download_safe(symbol, LOOKBACK_D1, "1d")
+    h4 = yf_download_safe(symbol, LOOKBACK_H4, "4h")
+    m30 = yf_download_safe(symbol, LOOKBACK_M30, "30m")
+    if d1 is None or h4 is None or m30 is None:
+        return None
+
+    t_d1 = trend_score(d1)
+    t_h4 = trend_score(h4)
+    overall = t_d1 + t_h4
+
+    if overall >= 1:
+        side = "BUY"
+    elif overall <= -1:
+        side = "SELL"
+    else:
+        return None
+
+    px = last_price(m30)
+    a = atr(m30, 14).iloc[-1]
+    if a is None or pd.isna(a) or a <= 0:
+        return None
+    a = float(a)
+
+    if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
+        return None
+
+    liq_side = detect_liq_sweep_side(m30, a)
+    bos_side = detect_bos_side(m30)
+
+    liq_aligned = (liq_side == side)
+    bos_aligned = (bos_side == side)
+
+    if VIP_FILTER_PRO:
+        if not liq_aligned:
+            return None
+        if not bos_aligned:
+            return None
+    elif USE_LIQ_BOS:
+        if liq_side is None and bos_side is None:
+            return None
+        if liq_side is not None and liq_side != side and bos_side is None:
+            return None
+        if bos_side is not None and bos_side != side and liq_side is None:
+            return None
+        if liq_side is not None and bos_side is not None and liq_side != bos_side:
+            return None
+
+    ob = find_orderblock(m30, side)
+    fvg = find_fvg(m30, side)
+
+    zone_name = "None"
+    zone = None
+    if ob:
+        zone_name = "OrderBlock"
+        zone = ob
+    elif fvg:
+        zone_name = "FVG"
+        zone = fvg
+
+    if zone is None:
+        return None
+
+    zone_low = float(min(zone[0], zone[1]))
+    zone_high = float(max(zone[0], zone[1]))
+    mid = (zone_low + zone_high) / 2.0
+    dist_atr = abs(px - mid) / (a + 1e-9)
+
+    entry_type = "LIMIT"
+    entry = mid
+
+    strong_trend = abs(overall) == 2
+
+    allow_market = (
+        SMART_ENTRY
+        and bos_aligned
+        and strong_trend
+        and (dist_atr <= MARKET_ATR_MAX)
+    )
+
+    if LIQ_FAVOR_LIMIT and liq_aligned:
+        allow_market = False
+
+    if VIP_FILTER_PRO and not (bos_aligned and strong_trend and dist_atr <= MARKET_ATR_MAX):
+        allow_market = False
+
+    if MODE == "vip_retest":
+        if dist_atr > RETEST_ATR:
+            return None
+        if allow_market:
+            entry_type = "MARKET"
+            entry = px
+        else:
+            entry_type = "LIMIT"
+            entry = mid
+    else:
+        if allow_market:
+            entry_type = "MARKET"
+            entry = px
+        elif dist_atr <= MAX_PENDING_DISTANCE_ATR:
+            entry_type = "LIMIT"
+            entry = mid
+        else:
+            return None
 
     if side == "BUY":
-        ok, reason = valid_buy_entry(data)
-        return ok, reason, "BUY" if ok else None
+        sl = zone_low - (SL_BUFFER_ATR * a)
+    else:
+        sl = zone_high + (SL_BUFFER_ATR * a)
 
-    return False, "Unknown side", None
+    min_r = 0.25 * a
+    if abs(entry - sl) < min_r:
+        sl = (entry - 1.5 * a) if side == "BUY" else (entry + 1.5 * a)
+
+    tp1, tp2, tp3 = calc_rr_targets(entry, sl, side)
+
+    conf = 4
+    conf += 2 if strong_trend else 1
+    conf += 2 if zone_name in ("OrderBlock", "FVG") else 0
+    conf += 1 if liq_aligned else 0
+    conf += 1 if bos_aligned else 0
+    conf += 1 if entry_type == "MARKET" and bos_aligned else 0
+    conf += 1 if VIP_FILTER_PRO and liq_aligned and bos_aligned else 0
+    conf = int(max(1, min(10, conf)))
+
+    risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
+
+    return Plan(
+        label=label,
+        symbol=symbol,
+        timeframe="M30",
+        trend_d1=t_d1,
+        trend_h4=t_h4,
+        overall=overall,
+        side=side,
+        entry_type=entry_type,
+        entry=float(entry),
+        sl=float(sl),
+        tp1=float(tp1),
+        tp2=float(tp2),
+        tp3=float(tp3),
+        zone_name=zone_name,
+        zone_low=zone_low,
+        zone_high=zone_high,
+        atr_value=float(a),
+        confidence=conf,
+        risk_usd=float(risk_usd),
+        liq_side=liq_side,
+        bos_side=bos_side,
+    )
 
 
-def scan_for_new_entries(state: Dict, market_data: Dict[str, Dict], account_balance: float) -> None:
-    for symbol, data in market_data.items():
-        if any(p["symbol"] == symbol and p["status"] == "OPEN" for p in state["open_positions"]):
+# =========================
+# CHART
+# =========================
+def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
+    d = df.tail(120).copy()
+    d["EMA_FAST"] = ema(d["Close"], EMA_FAST)
+    d["EMA_SLOW"] = ema(d["Close"], EMA_SLOW)
+
+    x = list(range(len(d)))
+    o = d["Open"].values
+    h = d["High"].values
+    l = d["Low"].values
+    c = d["Close"].values
+
+    fig = plt.figure(figsize=(12, 7), dpi=150)
+    ax = plt.gca()
+
+    # Candles
+    for i in range(len(d)):
+        ax.plot([x[i], x[i]], [l[i], h[i]], linewidth=1)
+        y0 = min(o[i], c[i])
+        y1 = max(o[i], c[i])
+        rect = plt.Rectangle((x[i] - 0.32, y0), 0.64, max(y1 - y0, 1e-9), fill=False, linewidth=1)
+        ax.add_patch(rect)
+
+    # EMA
+    ax.plot(x, d["EMA_FAST"].values, linewidth=1.2, label=f"EMA{EMA_FAST}")
+    ax.plot(x, d["EMA_SLOW"].values, linewidth=1.2, label=f"EMA{EMA_SLOW}")
+
+    # Zone
+    if plan.zone_low is not None and plan.zone_high is not None:
+        ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.15)
+
+    # Levels
+    ax.axhline(plan.entry, linewidth=1.2, linestyle="--")
+    ax.axhline(plan.sl, linewidth=1.2, linestyle="--")
+    ax.axhline(plan.tp1, linewidth=1.0, linestyle=":")
+    ax.axhline(plan.tp2, linewidth=1.0, linestyle=":")
+    ax.axhline(plan.tp3, linewidth=1.0, linestyle=":")
+
+    title_side = "BUY" if plan.side == "BUY" else "SELL"
+    ax.set_title(f"{plan.label} ({plan.symbol}) | {plan.timeframe} | {title_side} {plan.entry_type}")
+    ax.grid(True, alpha=0.2)
+    ax.legend(loc="upper left", fontsize=9)
+
+    # X labels
+    idx = d.index
+    step = max(1, len(d) // 6)
+    ticks = list(range(0, len(d), step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([str(idx[i])[:16] for i in ticks], rotation=15, ha="right", fontsize=8)
+
+    # Technical analysis box
+    zone_txt = "None"
+    if plan.zone_low is not None and plan.zone_high is not None:
+        zone_txt = f"{plan.zone_name} [{fmt_price(plan.label, plan.zone_low, plan.entry)} - {fmt_price(plan.label, plan.zone_high, plan.entry)}]"
+
+    liq_txt = plan.liq_side if plan.liq_side else "NO"
+    bos_txt = plan.bos_side if plan.bos_side else "NO"
+
+    analysis_text = (
+        f"Analysis\n"
+        f"D1/H4: {plan.trend_d1:+d}/{plan.trend_h4:+d} | Overall: {plan.overall:+d}\n"
+        f"Liq: {liq_txt} | BOS: {bos_txt}\n"
+        f"Zone: {zone_txt}\n"
+        f"Entry: {fmt_price(plan.label, plan.entry, plan.entry)}\n"
+        f"SL: {fmt_price(plan.label, plan.sl, plan.entry)}\n"
+        f"TP1: {fmt_price(plan.label, plan.tp1, plan.entry)}\n"
+        f"Conf: {plan.confidence}/10"
+    )
+
+    ax.text(
+        0.01, 0.98, analysis_text,
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", alpha=0.15)
+    )
+
+    buf = io.BytesIO()
+    plt.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+# =========================
+# DAILY REPORT
+# =========================
+def _hit_in_bar(high_: float, low_: float, level: float) -> bool:
+    return low_ <= level <= high_
+
+
+def register_trade_for_daily(state: dict, plan: Plan) -> str:
+    tid = hashlib.sha1(
+        f"{plan.symbol}|{plan.side}|{plan.entry}|{time.time()}".encode("utf-8")
+    ).hexdigest()[:18]
+
+    now = time.time()
+    state.setdefault("open_trades", {})[tid] = {
+        "id": tid,
+        "date": _utc_date_str(now),
+        "ts": now,
+        "symbol": plan.symbol,
+        "label": plan.label,
+        "side": plan.side,
+        "entry": float(plan.entry),
+        "sl": float(plan.sl),
+        "tp1": float(plan.tp1),
+        "tp2": float(plan.tp2),
+        "tp3": float(plan.tp3),
+        "status": "OPEN",
+    }
+
+    day = _utc_date_str(now)
+    daily = state.setdefault("daily", {}).setdefault(day, {
+        "signals": 0,
+        "avg_conf_sum": 0,
+        "avg_conf_n": 0,
+        "wins": 0,
+        "losses": 0,
+        "tp1": 0,
+        "tp2": 0,
+        "tp3": 0,
+        "open": 0,
+    })
+    daily["signals"] += 1
+    daily["avg_conf_sum"] += int(plan.confidence)
+    daily["avg_conf_n"] += 1
+    daily["open"] += 1
+    return tid
+
+
+def update_trade_outcomes(state: dict) -> None:
+    open_trades = state.get("open_trades", {})
+    if not open_trades:
+        return
+
+    for tid, tr in list(open_trades.items()):
+        if tr.get("status") != "OPEN":
             continue
 
-        ok, reason, side = should_send_signal(state, symbol, data)
-        if not ok or not side:
-            logger.info("%s skipped: %s", symbol, reason)
+        symbol = tr.get("symbol")
+        df = yf_download_safe(symbol, "5d", "30m")
+        if df is None or df.empty:
             continue
 
-        data["reason"] = reason
-        position = create_position(symbol, side, data, account_balance)
-        state["open_positions"].append(position)
-        state["daily_stats"]["signals_sent_today"] += 1
-        send_telegram_message(build_entry_message(position))
+        ts = float(tr.get("ts", 0))
+        if isinstance(df.index, pd.DatetimeIndex):
+            epoch = (df.index.astype("int64") // 10**9).astype("int64")
+            df2 = df.copy()
+            df2["_epoch"] = epoch
+            df2 = df2[df2["_epoch"] >= int(ts)]
+        else:
+            df2 = df
+
+        if df2.empty:
+            continue
+
+        sl = float(tr["sl"])
+        tp1 = float(tr["tp1"])
+        tp2 = float(tr["tp2"])
+        tp3 = float(tr["tp3"])
+
+        resolved = None
+        for _, row in df2.iterrows():
+            hi = float(row["High"])
+            lo = float(row["Low"])
+
+            sl_hit = _hit_in_bar(hi, lo, sl)
+            tp1_hit = _hit_in_bar(hi, lo, tp1)
+            tp2_hit = _hit_in_bar(hi, lo, tp2)
+            tp3_hit = _hit_in_bar(hi, lo, tp3)
+
+            if sl_hit:
+                resolved = "SL"
+                break
+            if tp3_hit:
+                resolved = "TP3"
+                break
+            if tp2_hit:
+                resolved = "TP2"
+                break
+            if tp1_hit:
+                resolved = "TP1"
+                break
+
+        if resolved:
+            tr["status"] = resolved
+            day = tr.get("date") or _utc_date_str(ts)
+            daily = state.setdefault("daily", {}).setdefault(day, {
+                "signals": 0,
+                "avg_conf_sum": 0,
+                "avg_conf_n": 0,
+                "wins": 0,
+                "losses": 0,
+                "tp1": 0,
+                "tp2": 0,
+                "tp3": 0,
+                "open": 0,
+            })
+            daily["open"] = max(0, int(daily["open"]) - 1)
+
+            if resolved == "SL":
+                daily["losses"] += 1
+            else:
+                daily["wins"] += 1
+                if resolved == "TP1":
+                    daily["tp1"] += 1
+                elif resolved == "TP2":
+                    daily["tp2"] += 1
+                elif resolved == "TP3":
+                    daily["tp3"] += 1
 
 
-# =========================================
-# MARKET DATA PLACEHOLDER
-# =========================================
-def get_mock_market_data() -> Dict[str, Dict]:
-    """
-    هذه مجرد بيانات تجريبية.
-    استبدلها ببياناتك الحقيقية من yfinance أو API آخر.
-    """
+def format_daily_report(state: dict, day: Optional[str] = None) -> str:
+    day = day or _utc_date_str()
+    d = state.get("daily", {}).get(day)
+    if not d:
+        return f"📊 الحصيلة اليومية {day} (UTC)\nلا توجد إشارات مسجلة اليوم."
 
-    return {
-        "US100": {
-            "symbol": "US100",
-            "side": "SELL",
-            "price": 24695.0,
-            "entry": 24699.88,
-            "sl": 24757.33,
-            "tp1": 24668.0,
-            "tp2": 24608.75,
-            "tp3": 24592.75,
-            "zone_low": 24653.75,
-            "zone_high": 24746.0,
-            "confidence": 8,
+    avg_conf = (float(d.get("avg_conf_sum", 0)) / float(d.get("avg_conf_n", 1))) if d.get("avg_conf_n", 0) else 0.0
+    wins = int(d.get("wins", 0))
+    losses = int(d.get("losses", 0))
+    open_ = int(d.get("open", 0))
+    total = int(d.get("signals", 0))
+    closed = wins + losses
+    winrate = (wins / max(1, closed)) * 100.0
 
-            "d1_trend": -1,
-            "h4_trend": -1,
-            "m15_trend": -1,
+    return (
+        f"📊 الحصيلة اليومية {day} (UTC)\n"
+        f"— إشارات: {total}\n"
+        f"— متوسط الثقة: {avg_conf:.1f}/10\n"
+        f"— صفقات مُغلقة: {closed}\n"
+        f"✅ Wins: {wins} | ❌ Losses: {losses} | WinRate: {winrate:.1f}%\n"
+        f"🎯 TP1: {int(d.get('tp1', 0))} | TP2: {int(d.get('tp2', 0))} | TP3: {int(d.get('tp3', 0))}\n"
+        f"⏳ Open: {open_}\n\n"
+        f"ملاحظة: التقييم تقريبي اعتماداً على شموع Yahoo M30."
+    )
 
-            "atr": 55.0,
 
-            "recent_highs": [24670.0, 24682.0, 24690.0],
-            "recent_lows": [24580.0, 24570.0, 24565.0],
+def maybe_send_daily_report(state: dict) -> None:
+    now = time.gmtime()
+    day = _utc_date_str()
+    last = str(state.get("last_report_date", ""))
 
-            "last_swing_low": 24685.0,
-            "last_swing_high": 24720.0,
+    if now.tm_hour == DAILY_REPORT_HOUR and now.tm_min >= DAILY_REPORT_MINUTE and last != day:
+        tg_send_message(CHAT_ID, format_daily_report(state, day))
+        state["last_report_date"] = day
+        save_state(state)
 
-            "current_high": 24696.5,
-            "current_low": 24660.0,
-            "current_close": 24680.0,
 
-            "confirm_candle": {
-                "open": 24692.0,
-                "high": 24702.0,
-                "low": 24678.0,
-                "close": 24681.0
-            },
-            "prev_candle": {
-                "open": 24685.0,
-                "high": 24694.0,
-                "low": 24680.0,
-                "close": 24691.0
-            },
+# =========================
+# FORMAT + DEDUP
+# =========================
+def format_plan(plan: Plan) -> str:
+    px_hint = plan.entry
+    side_emoji = "🟢" if plan.side == "BUY" else "🔴"
 
-            "bars_since_entry": 3,
-            "reached_tp1": False
-        },
+    if plan.entry_type == "LIMIT":
+        order = "Buy Limit" if plan.side == "BUY" else "Sell Limit"
+    else:
+        order = "BUY Market" if plan.side == "BUY" else "SELL Market"
 
-        "US30": {
-            "symbol": "US30",
-            "side": "SELL",
-            "price": 47150.0,
-            "entry": 47167.88,
-            "sl": 47245.94,
-            "tp1": 47089.81,
-            "tp2": 47011.74,
-            "tp3": 46933.68,
-            "zone_low": 47109.14,
-            "zone_high": 47226.61,
-            "confidence": 8,
+    zone_txt = "—"
+    if plan.zone_low is not None and plan.zone_high is not None:
+        zone_txt = (
+            f"{plan.zone_name} "
+            f"[{fmt_price(plan.label, plan.zone_low, px_hint)} - {fmt_price(plan.label, plan.zone_high, px_hint)}]"
+        )
 
-            "d1_trend": -1,
-            "h4_trend": -1,
-            "m15_trend": -1,
+    liq_txt = plan.liq_side if plan.liq_side is not None else "❌"
+    bos_txt = plan.bos_side if plan.bos_side is not None else "❌"
 
-            "atr": 85.0,
+    return (
+        f"🔥 VIP M30\n"
+        f"📌 {plan.label} ({plan.symbol})\n"
+        f"Trend D1/H4: {plan.trend_d1:+d} / {plan.trend_h4:+d} => Overall: {plan.overall:+d}\n"
+        f"Liq Sweep: {liq_txt} | BOS: {bos_txt}\n\n"
+        f"{side_emoji} {order}: {fmt_price(plan.label, plan.entry, px_hint)}\n"
+        f"SL: {fmt_price(plan.label, plan.sl, px_hint)}\n"
+        f"TP1: {fmt_price(plan.label, plan.tp1, px_hint)}\n"
+        f"TP2: {fmt_price(plan.label, plan.tp2, px_hint)}\n"
+        f"TP3: {fmt_price(plan.label, plan.tp3, px_hint)}\n\n"
+        f"Zone: {zone_txt}\n"
+        f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
+        f"Confidence: {plan.confidence}/10\n"
+        f"Mode: {MODE} | VIP_FILTER_PRO={int(VIP_FILTER_PRO)} | SMART_ENTRY={int(SMART_ENTRY)}\n"
+    )
 
-            "recent_highs": [47130.0, 47140.0, 47149.0],
-            "recent_lows": [46990.0, 46980.0, 46970.0],
 
-            "last_swing_low": 47120.0,
-            "last_swing_high": 47190.0,
+def signal_hash(plan: Plan) -> str:
+    key = (
+        f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry}|{plan.sl}|"
+        f"{plan.tp1}|{plan.tp2}|{plan.tp3}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}|"
+        f"liq={plan.liq_side}|bos={plan.bos_side}"
+    )
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
-            "current_high": 47155.0,
-            "current_low": 47100.0,
-            "current_close": 47110.0,
 
-            "confirm_candle": {
-                "open": 47145.0,
-                "high": 47165.0,
-                "low": 47105.0,
-                "close": 47112.0
-            },
-            "prev_candle": {
-                "open": 47120.0,
-                "high": 47150.0,
-                "low": 47115.0,
-                "close": 47140.0
-            },
+def should_send(state: dict, plan: Plan) -> bool:
+    now = time.time()
+    rec = state.get("last_sent", {}).get(plan.symbol, {})
+    last_ts = float(rec.get("ts", 0))
+    last_hash = rec.get("hash", "")
+    h = signal_hash(plan)
+    cooldown = COOLDOWN_MINUTES * 60
 
-            "bars_since_entry": 2,
-            "reached_tp1": False
-        }
+    if (now - last_ts) < cooldown:
+        return False
+    if h == last_hash and (now - last_ts) < cooldown:
+        return False
+    return True
+
+
+def mark_sent(state: dict, plan: Plan) -> None:
+    state.setdefault("last_sent", {})[plan.symbol] = {
+        "ts": time.time(),
+        "hash": signal_hash(plan),
     }
 
 
-# =========================================
-# MAIN LOOP
-# =========================================
-def main():
-    account_balance = float(os.getenv("ACCOUNT_BALANCE", "100"))
+# =========================
+# COMMANDS
+# =========================
+HELP_TEXT = (
+    "✅ أوامر VIP:\n"
+    "/help\n"
+    "/status\n"
+    "/symbols\n"
+    "/mode vip_retest أو /mode vip_mix\n"
+    "/analyze XAU\n"
+    "/scan\n"
+    "/daily\n"
+    "/pause | /resume\n"
+)
 
-    send_telegram_message("👻 <b>بوت الشبح المطور بدأ التشغيل</b>")
+ALIASES = {
+    "/xau": "XAU",
+    "/xag": "XAG",
+    "/us100": "US100",
+    "/us30": "US30",
+    "/ger40": "GER40",
+    "/oil": "OILCASH",
+    "/btc": "BTC",
+    "/eurusd": "EURUSD",
+    "/usdjpy": "USDJPY",
+}
+
+
+def _strip_botname(cmd: str) -> str:
+    return cmd.split("@", 1)[0] if "@" in cmd else cmd
+
+
+def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> None:
+    msg = update.get("message") or update.get("channel_post") or {}
+    text = (msg.get("text") or "").strip()
+    if not text.startswith("/"):
+        return
+
+    chat = msg.get("chat", {})
+    chat_id = str(chat.get("id", "")) if chat.get("id") is not None else ""
+    if not chat_id:
+        return
+
+    parts = text.split()
+    cmd_raw = parts[0].lower()
+    cmd = _strip_botname(cmd_raw)
+
+    if cmd in ALIASES:
+        parts = ["/analyze", ALIASES[cmd]]
+        cmd = "/analyze"
+
+    global MODE
+
+    if cmd in ("/help", "/halp"):
+        tg_send_message(chat_id, HELP_TEXT)
+        return
+
+    if cmd == "/status":
+        tg_send_message(
+            chat_id,
+            f"MODE={MODE}\n"
+            f"CHECK_INTERVAL_SEC={CHECK_INTERVAL_SEC}\n"
+            f"COOLDOWN_MINUTES={COOLDOWN_MINUTES}\n"
+            f"RETEST_ATR={RETEST_ATR}\n"
+            f"MAX_PENDING_DISTANCE_ATR={MAX_PENDING_DISTANCE_ATR}\n"
+            f"MARKET_ATR_MAX={MARKET_ATR_MAX}\n"
+            f"SL_BUFFER_ATR={SL_BUFFER_ATR}\n"
+            f"MAX_ATR_PCT={MAX_ATR_PCT}\n"
+            f"SMART_ENTRY={int(SMART_ENTRY)}\n"
+            f"VIP_FILTER_PRO={int(VIP_FILTER_PRO)}\n"
+            f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
+            f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
+            f"ASIA_ALLOWED=XAU,XAG,US100,US30,GER40,OILCASH\n"
+            f"WEEKEND_FILTER=1\n"
+            f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
+            f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
+            f"RISK_PCT={RISK_PCT}\n"
+            f"PAUSED={state.get('paused', False)}"
+        )
+        return
+
+    if cmd == "/symbols":
+        items = sorted(SYMBOLS.items(), key=lambda x: x[0])
+        tg_send_message(chat_id, "Symbols: " + ", ".join([f"{k}={v}" for k, v in items]))
+        return
+
+    if cmd == "/mode" and len(parts) >= 2:
+        m = parts[1].strip().lower()
+        if m in ("vip_retest", "vip_mix"):
+            MODE = m
+            tg_send_message(chat_id, f"✅ MODE set to {MODE}")
+        else:
+            tg_send_message(chat_id, "❌ mode يجب أن يكون vip_retest أو vip_mix")
+        return
+
+    if cmd == "/pause":
+        state["paused"] = True
+        save_state(state)
+        tg_send_message(chat_id, "⏸️ تم إيقاف الإشارات التلقائية مؤقتاً.")
+        return
+
+    if cmd == "/resume":
+        state["paused"] = False
+        save_state(state)
+        tg_send_message(chat_id, "▶️ تم تشغيل الإشارات التلقائية.")
+        return
+
+    if cmd == "/daily":
+        update_trade_outcomes(state)
+        tg_send_message(chat_id, format_daily_report(state))
+        save_state(state)
+        return
+
+    if cmd == "/analyze" and len(parts) >= 2:
+        sym_key = parts[1].upper().strip()
+        if sym_key not in SYMBOLS:
+            tg_send_message(chat_id, "❌ الرمز غير معروف. جرّب /symbols")
+            return
+
+        if not market_is_open_for_symbol(sym_key):
+            tg_send_message(chat_id, f"🚫 السوق مغلق الآن لـ {sym_key}.")
+            return
+
+        if not session_allowed_for_symbol(sym_key):
+            tg_send_message(chat_id, f"⏰ {sym_key} خارج جلسة التداول المسموح بها الآن.")
+            return
+
+        plan = build_plan(sym_key, SYMBOLS[sym_key])
+        if plan is None:
+            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key} حسب شروط VIP.")
+            return
+
+        m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
+        if m30 is None or m30.empty:
+            tg_send_message(chat_id, "⚠️ تعذر جلب بيانات الشارت.")
+            return
+
+        caption = format_plan(plan)
+
+        # text first
+        tg_send_message(chat_id, caption)
+
+        # then technical chart
+        img = render_chart(m30, plan)
+        tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+
+        register_trade_for_daily(state, plan)
+        save_state(state)
+        return
+
+    if cmd == "/scan":
+        plans: List[Tuple[int, Plan]] = []
+
+        for k, sym in SYMBOLS.items():
+            if not market_is_open_for_symbol(k):
+                continue
+            if not session_allowed_for_symbol(k):
+                continue
+
+            p = build_plan(k, sym)
+            if p is None:
+                continue
+            if p.confidence < MIN_CONF_SCAN:
+                continue
+
+            score = p.confidence
+            score += 1 if p.liq_side == p.side else 0
+            score += 1 if p.bos_side == p.side else 0
+            plans.append((score, p))
+
+        if not plans:
+            tg_send_message(chat_id, "⚠️ لا توجد إشارات قوية حالياً.")
+            return
+
+        plans.sort(key=lambda x: x[0], reverse=True)
+        top = [p for _, p in plans[:max(1, SCAN_TOP_N)]]
+
+        for i, plan in enumerate(top, start=1):
+            m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
+            if m30 is None or m30.empty:
+                continue
+
+            caption = f"🔥 TOP VIP SIGNAL #{i}\n\n" + format_plan(plan)
+
+            # text first
+            tg_send_message(chat_id, caption)
+
+            # then chart
+            img = render_chart(m30, plan)
+            tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+
+            register_trade_for_daily(state, plan)
+            save_state(state)
+            time.sleep(1)
+        return
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.error("Missing BOT_TOKEN or CHAT_ID.")
+        return
+
+    tg_delete_webhook()
+
+    me = tg_get_me()
+    bot_username = me.get("username") if me else None
+    if bot_username:
+        logger.info("Bot username: @%s", bot_username)
+
+    state = load_state()
+    logger.info(
+        "VIP bot started. MODE=%s | VIP_FILTER_PRO=%s | SMART_ENTRY=%s | CHAT_ID=%s",
+        MODE, int(VIP_FILTER_PRO), int(SMART_ENTRY), CHAT_ID
+    )
+
+    tg_send_message(
+        CHAT_ID,
+        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + Technical Chart). اكتب /help"
+    )
+
+    last_check = 0.0
 
     while True:
         try:
-            state = load_state()
-            state = reset_daily_state_if_needed(state)
+            update_trade_outcomes(state)
+            maybe_send_daily_report(state)
 
-            market_data = get_mock_market_data()
+            offset = int(state.get("tg_offset", 0))
+            upd = tg_get_updates(offset)
+            if upd.get("ok") and upd.get("result"):
+                for u in upd["result"]:
+                    state["tg_offset"] = u["update_id"] + 1
+                    handle_command(state, u, bot_username)
+                save_state(state)
 
-            monitor_open_positions(state, market_data)
-            scan_for_new_entries(state, market_data, account_balance)
+            if state.get("paused", False):
+                time.sleep(1)
+                continue
 
-            # تنظيف الصفقات المغلقة من القائمة إن أردت
-            # state["open_positions"] = [p for p in state["open_positions"] if p["status"] == "OPEN"]
+            now = time.time()
+            if now - last_check < CHECK_INTERVAL_SEC:
+                time.sleep(1)
+                continue
+            last_check = now
 
-            save_state(state)
-            time.sleep(CHECK_INTERVAL)
+            for label, sym in SYMBOLS.items():
+                if not market_is_open_for_symbol(label):
+                    continue
+                if not session_allowed_for_symbol(label):
+                    continue
 
-        except KeyboardInterrupt:
-            logger.info("Bot stopped manually.")
-            break
+                plan = build_plan(label, sym)
+                if plan is None:
+                    continue
+                if not should_send(state, plan):
+                    continue
+
+                m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
+                if m30 is None or m30.empty:
+                    continue
+
+                caption = format_plan(plan)
+
+                # text first
+                tg_send_message(CHAT_ID, caption)
+
+                # then technical chart
+                img = render_chart(m30, plan)
+                tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
+
+                mark_sent(state, plan)
+                register_trade_for_daily(state, plan)
+                save_state(state)
+                time.sleep(1)
+
         except Exception as e:
             logger.exception("Main loop error: %s", e)
-            send_telegram_message(f"⚠️ Bot error: {str(e)}")
-            time.sleep(CHECK_INTERVAL)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
