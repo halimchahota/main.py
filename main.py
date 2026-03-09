@@ -31,7 +31,7 @@ logger = logging.getLogger("vip_bot")
 # ENV / CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # @channel OR -100xxxxxxxxxx (group id)
+CHAT_ID = os.getenv("CHAT_ID", "").strip()  # @channel OR -100xxxxxxxxxx
 
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
@@ -94,7 +94,7 @@ LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
 # SYMBOLS
 # =========================
 SYMBOLS: Dict[str, str] = {
-    # --- FX (Yahoo: =X) ---
+    # --- FX ---
     "EURUSD": os.getenv("EURUSD_SYMBOL", "EURUSD=X"),
     "GBPUSD": os.getenv("GBPUSD_SYMBOL", "GBPUSD=X"),
     "USDJPY": os.getenv("USDJPY_SYMBOL", "USDJPY=X"),
@@ -136,15 +136,37 @@ def is_crypto_label(label: str) -> bool:
     return label.upper() in CRYPTO_LABELS
 
 
+def is_asia_allowed_label(label: str) -> bool:
+    """
+    Gold + indices + oil allowed in Asia too
+    """
+    asia_allowed = {
+        "XAU",
+        "US100",
+        "US30",
+        "SPX",
+        "DAX",
+        "HK50",
+        "GER40CASH",
+        "OIL",
+        "BRENTCASH",
+    }
+    return label.upper() in asia_allowed
+
+
 def session_allowed_for_symbol(label: str) -> bool:
     """
-    Forex / indices / metals / oil: فقط London + New York
     Crypto: 24/7
+    Gold + indices + oil: allowed in Asia too
+    Forex + other commodities: London + New York only
     """
     if not USE_SESSION_FILTER:
         return True
 
     if is_crypto_label(label):
+        return True
+
+    if is_asia_allowed_label(label):
         return True
 
     now = time.gmtime()
@@ -161,7 +183,7 @@ def is_weekend_utc() -> bool:
 def market_is_open_for_symbol(label: str) -> bool:
     """
     Crypto: always open
-    Forex / indices / metals / oil: closed on weekend
+    All non-crypto: closed on weekend
     """
     if is_crypto_label(label):
         return True
@@ -821,7 +843,7 @@ def format_daily_report(state: dict, day: Optional[str] = None) -> str:
     open_ = int(d.get("open", 0))
     total = int(d.get("signals", 0))
     closed = wins + losses
-    winrate = (wins / max(1, closed)) * 100.0
+    winrate = (wins / max(1, closed))) * 100.0
 
     return (
         f"📊 الحصيلة اليومية {day} (UTC)\n"
@@ -978,6 +1000,7 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"SMART_ENTRY={int(SMART_ENTRY)} | MARKET_ATR_MAX={MARKET_ATR_MAX}\n"
             f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
             f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
+            f"ASIA_ALLOWED=XAU,US100,US30,SPX,DAX,HK50,GER40CASH,OIL,BRENTCASH\n"
             f"WEEKEND_FILTER=1\n"
             f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
             f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
@@ -1114,7 +1137,7 @@ def main():
         MODE, int(SMART_ENTRY), int(USE_SESSION_FILTER), CHAT_ID
     )
 
-    tg_send_message(CHAT_ID, "✅ VIP Bot Online (Stronger VIP + Smart Entry + Smart Session + Weekend Filter + Daily). اكتب /help")
+    tg_send_message(CHAT_ID, "✅ VIP Bot Online (VIP Strong + Smart Entry + Smart Session + Asia Gold/Indices/Oil + Weekend Filter + Daily). اكتب /help")
 
     last_check = 0.0
 
