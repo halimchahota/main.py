@@ -5,7 +5,7 @@ import time
 import json
 import hashlib
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
 import requests
@@ -36,7 +36,7 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "180"))
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
 MODE = os.getenv("MODE", "vip_retest").strip().lower()  # vip_retest | vip_mix
@@ -53,13 +53,14 @@ UPDATES_TIMEOUT = 30
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
-LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "200d")
-LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "140d")
-LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "45d")
+LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "90d")
+LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "60d")
+LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "15d")
 
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
 
 USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
+VIP_FILTER_PRO = os.getenv("VIP_FILTER_PRO", "1").strip() == "1"
 SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
 LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
 
@@ -73,40 +74,21 @@ USE_SESSION_FILTER = os.getenv("USE_SESSION_FILTER", "1").strip() == "1"
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
 
-CRYPTO_LABELS = {"BTC", "ETH"}
+CRYPTO_LABELS = {"BTC"}
+
 
 # =========================
-# SYMBOLS
+# SYMBOLS (FAST TEST SET)
 # =========================
 SYMBOLS: Dict[str, str] = {
-    # FX
-    "EURUSD": os.getenv("EURUSD_SYMBOL", "EURUSD=X"),
-    "GBPUSD": os.getenv("GBPUSD_SYMBOL", "GBPUSD=X"),
-    "USDJPY": os.getenv("USDJPY_SYMBOL", "USDJPY=X"),
-    "AUDUSD": os.getenv("AUDUSD_SYMBOL", "AUDUSD=X"),
-    "USDCAD": os.getenv("USDCAD_SYMBOL", "USDCAD=X"),
-    "USDCHF": os.getenv("USDCHF_SYMBOL", "USDCHF=X"),
-    "NZDUSD": os.getenv("NZDUSD_SYMBOL", "NZDUSD=X"),
-
-    # Indices
+    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
     "US100": os.getenv("US100_SYMBOL", "NQ=F"),
     "US30": os.getenv("US30_SYMBOL", "^DJI"),
-    "SPX": os.getenv("SPX_SYMBOL", "^GSPC"),
-    "DAX": os.getenv("DAX_SYMBOL", "^GDAXI"),
-    "HK50": os.getenv("HK50_SYMBOL", "^HSI"),
-    "GER40CASH": os.getenv("GER40CASH_SYMBOL", "^GDAXI"),
-
-    # Commodities
-    "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
-    "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
-    "OIL": os.getenv("OIL_SYMBOL", "CL=F"),
-    "BRENTCASH": os.getenv("BRENTCASH_SYMBOL", "BZ=F"),
-    "NG": os.getenv("NG_SYMBOL", "NG=F"),
-    "COPPER": os.getenv("COPPER_SYMBOL", "HG=F"),
-
-    # Crypto
+    "GER40": os.getenv("GER40_SYMBOL", "^GDAXI"),
+    "OILCASH": os.getenv("OILCASH_SYMBOL", "CL=F"),
     "BTC": os.getenv("BTC_SYMBOL", "BTC-USD"),
-    "ETH": os.getenv("ETH_SYMBOL", "ETH-USD"),
+    "EURUSD": os.getenv("EURUSD_SYMBOL", "EURUSD=X"),
+    "USDJPY": os.getenv("USDJPY_SYMBOL", "USDJPY=X"),
 }
 
 TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
@@ -124,21 +106,24 @@ def is_asia_allowed_label(label: str) -> bool:
         "XAU",
         "US100",
         "US30",
-        "SPX",
-        "DAX",
-        "HK50",
-        "GER40CASH",
-        "OIL",
-        "BRENTCASH",
+        "GER40",
+        "OILCASH",
     }
     return label.upper() in asia_allowed
 
 
 def session_allowed_for_symbol(label: str) -> bool:
+    """
+    Crypto: 24/7
+    Gold + indices + oil: allowed in Asia too
+    Forex: London + New York only
+    """
     if not USE_SESSION_FILTER:
         return True
+
     if is_crypto_label(label):
         return True
+
     if is_asia_allowed_label(label):
         return True
 
@@ -147,11 +132,15 @@ def session_allowed_for_symbol(label: str) -> bool:
 
 
 def is_weekend_utc() -> bool:
-    wd = time.gmtime().tm_wday  # Mon=0 Sun=6
-    return wd in (5, 6)
+    wd = time.gmtime().tm_wday  # Monday=0 ... Sunday=6
+    return wd in (5, 6)  # Saturday, Sunday
 
 
 def market_is_open_for_symbol(label: str) -> bool:
+    """
+    Crypto: always open
+    All non-crypto: closed on weekend
+    """
     if is_crypto_label(label):
         return True
     return not is_weekend_utc()
@@ -535,14 +524,21 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     liq_side = detect_liq_sweep_side(m30, a)
     bos_side = detect_bos_side(m30)
 
-    if USE_LIQ_BOS:
+    liq_aligned = (liq_side == side)
+    bos_aligned = (bos_side == side)
+
+    if VIP_FILTER_PRO:
+        if not liq_aligned:
+            return None
+        if not bos_aligned:
+            return None
+    elif USE_LIQ_BOS:
         if liq_side is None and bos_side is None:
             return None
         if liq_side is not None and liq_side != side and bos_side is None:
             return None
         if bos_side is not None and bos_side != side and liq_side is None:
             return None
-        # إذا كان الاثنان موجودين لكن بعكس بعض، نرفض الإشارة
         if liq_side is not None and bos_side is not None and liq_side != bos_side:
             return None
 
@@ -570,8 +566,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     entry = mid
 
     strong_trend = abs(overall) == 2
-    bos_aligned = bos_side == side
-    liq_aligned = liq_side == side
 
     allow_market = (
         SMART_ENTRY
@@ -580,7 +574,10 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         and (dist_atr <= MARKET_ATR_MAX)
     )
 
-    if LIQ_FAVOR_LIMIT and liq_aligned and not bos_aligned:
+    if LIQ_FAVOR_LIMIT and liq_aligned:
+        allow_market = False
+
+    if VIP_FILTER_PRO and not (bos_aligned and strong_trend and dist_atr <= MARKET_ATR_MAX):
         allow_market = False
 
     if MODE == "vip_retest":
@@ -619,6 +616,7 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     conf += 1 if liq_aligned else 0
     conf += 1 if bos_aligned else 0
     conf += 1 if entry_type == "MARKET" and bos_aligned else 0
+    conf += 1 if VIP_FILTER_PRO and liq_aligned and bos_aligned else 0
     conf = int(max(1, min(10, conf)))
 
     risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
@@ -903,7 +901,7 @@ def format_plan(plan: Plan) -> str:
         f"Zone: {zone_txt}\n"
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
         f"Confidence: {plan.confidence}/10\n"
-        f"Mode: {MODE} | SMART_ENTRY={int(SMART_ENTRY)}\n"
+        f"Mode: {MODE} | VIP_FILTER_PRO={int(VIP_FILTER_PRO)} | SMART_ENTRY={int(SMART_ENTRY)}\n"
     )
 
 
@@ -946,8 +944,8 @@ HELP_TEXT = (
     "/help\n"
     "/status\n"
     "/symbols\n"
-    "/mode vip_retest  أو  /mode vip_mix\n"
-    "/analyze XAU  (أو BTC / US100 / US30 / OIL / GER40CASH / BRENTCASH ...)\n"
+    "/mode vip_retest أو /mode vip_mix\n"
+    "/analyze XAU\n"
     "/scan\n"
     "/daily\n"
     "/pause | /resume\n"
@@ -955,16 +953,13 @@ HELP_TEXT = (
 
 ALIASES = {
     "/xau": "XAU",
-    "/btc": "BTC",
-    "/eth": "ETH",
-    "/us30": "US30",
     "/us100": "US100",
-    "/oil": "OIL",
+    "/us30": "US30",
+    "/ger40": "GER40",
+    "/oil": "OILCASH",
+    "/btc": "BTC",
     "/eurusd": "EURUSD",
-    "/gbpusd": "GBPUSD",
     "/usdjpy": "USDJPY",
-    "/ger40": "GER40CASH",
-    "/brent": "BRENTCASH",
 }
 
 
@@ -1009,9 +1004,10 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"SL_BUFFER_ATR={SL_BUFFER_ATR}\n"
             f"MAX_ATR_PCT={MAX_ATR_PCT}\n"
             f"SMART_ENTRY={int(SMART_ENTRY)}\n"
+            f"VIP_FILTER_PRO={int(VIP_FILTER_PRO)}\n"
             f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
             f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
-            f"ASIA_ALLOWED=XAU,US100,US30,SPX,DAX,HK50,GER40CASH,OIL,BRENTCASH\n"
+            f"ASIA_ALLOWED=XAU,US100,US30,GER40,OILCASH\n"
             f"WEEKEND_FILTER=1\n"
             f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
             f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
@@ -1146,13 +1142,13 @@ def main():
 
     state = load_state()
     logger.info(
-        "VIP bot started. MODE=%s | SMART_ENTRY=%s | SESSION_FILTER=%s | CHAT_ID=%s",
-        MODE, int(SMART_ENTRY), int(USE_SESSION_FILTER), CHAT_ID
+        "VIP bot started. MODE=%s | VIP_FILTER_PRO=%s | SMART_ENTRY=%s | CHAT_ID=%s",
+        MODE, int(VIP_FILTER_PRO), int(SMART_ENTRY), CHAT_ID
     )
 
     tg_send_message(
         CHAT_ID,
-        "✅ VIP Bot Online (SMC + Liquidity Sweep + BOS + OB/FVG + Smart Entry + Daily). اكتب /help"
+        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + VIP Filter PRO). اكتب /help"
     )
 
     last_check = 0.0
