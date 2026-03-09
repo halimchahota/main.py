@@ -52,6 +52,14 @@ UPDATES_TIMEOUT = 30
 
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+
+# Strong RSI filter
+RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "35"))
+RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "65"))
+
+# Fibonacci swing lookback
+FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "50"))
 
 LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "90d")
 LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "60d")
@@ -63,6 +71,8 @@ USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
 VIP_FILTER_PRO = os.getenv("VIP_FILTER_PRO", "1").strip() == "1"
 SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
 LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
+USE_RSI_FILTER = os.getenv("USE_RSI_FILTER", "1").strip() == "1"
+USE_FIB_FILTER = os.getenv("USE_FIB_FILTER", "1").strip() == "1"
 
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
 MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "8"))
@@ -115,18 +125,10 @@ def is_asia_allowed_label(label: str) -> bool:
 
 
 def session_allowed_for_symbol(label: str) -> bool:
-    """
-    Crypto: 24/7
-    Gold + Silver + indices + oil: allowed in Asia too
-    Forex: London + New York only
-    When USE_SESSION_FILTER=0 => all sessions
-    """
     if not USE_SESSION_FILTER:
         return True
-
     if is_crypto_label(label):
         return True
-
     if is_asia_allowed_label(label):
         return True
 
@@ -135,15 +137,11 @@ def session_allowed_for_symbol(label: str) -> bool:
 
 
 def is_weekend_utc() -> bool:
-    wd = time.gmtime().tm_wday  # Monday=0 ... Sunday=6
-    return wd in (5, 6)  # Saturday, Sunday
+    wd = time.gmtime().tm_wday
+    return wd in (5, 6)
 
 
 def market_is_open_for_symbol(label: str) -> bool:
-    """
-    Crypto: always open
-    All non-crypto: closed on weekend
-    """
     if is_crypto_label(label):
         return True
     return not is_weekend_utc()
@@ -335,6 +333,19 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     return tr.rolling(n).mean()
 
 
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / (avg_loss + 1e-9)
+    return 100 - (100 / (1 + rs))
+
+
 def last_price(df: pd.DataFrame) -> float:
     return float(df["Close"].iloc[-1])
 
@@ -359,10 +370,6 @@ def trend_score(df: pd.DataFrame) -> int:
 # SMART MONEY DETECTION
 # =========================
 def detect_liq_sweep_side(df: pd.DataFrame, a: float) -> Optional[str]:
-    """
-    BUY = sweep low then close back above prior lows
-    SELL = sweep high then close back below prior highs
-    """
     if df is None or len(df) < 60 or a <= 0:
         return None
 
@@ -381,10 +388,6 @@ def detect_liq_sweep_side(df: pd.DataFrame, a: float) -> Optional[str]:
 
 
 def detect_bos_side(df: pd.DataFrame) -> Optional[str]:
-    """
-    BUY = close breaks prior swing high
-    SELL = close breaks prior swing low
-    """
     if df is None or len(df) < 60:
         return None
 
@@ -464,6 +467,35 @@ def find_fvg(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
     return best
 
 
+def fib_zone(df: pd.DataFrame, side: str, lookback: int = 50) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Returns:
+    buy side -> (fib62, fib79, swing_high, swing_low)
+    sell side -> (fib62, fib79, swing_high, swing_low)
+
+    For BUY: we want retracement inside lower zone of bullish leg.
+    For SELL: we want retracement inside upper zone of bearish leg.
+    """
+    if df is None or len(df) < lookback + 5:
+        return None
+
+    d = df.tail(lookback).copy()
+    swing_high = float(d["High"].max())
+    swing_low = float(d["Low"].min())
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return None
+
+    if side == "BUY":
+        fib62 = swing_high - rng * 0.618
+        fib79 = swing_high - rng * 0.786
+    else:
+        fib62 = swing_low + rng * 0.618
+        fib79 = swing_low + rng * 0.786
+
+    return float(fib62), float(fib79), swing_high, swing_low
+
+
 # =========================
 # PLAN
 # =========================
@@ -490,14 +522,19 @@ class Plan:
     risk_usd: float
     liq_side: Optional[str]
     bos_side: Optional[str]
+    rsi_value: float
+    fib62: Optional[float]
+    fib79: Optional[float]
+    swing_high: Optional[float]
+    swing_low: Optional[float]
 
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
-    r = abs(entry - sl)
-    r = max(r, 1e-9)
+    rr = abs(entry - sl)
+    rr = max(rr, 1e-9)
     if side == "BUY":
-        return entry + 1 * r, entry + 2 * r, entry + 3 * r
-    return entry - 1 * r, entry - 2 * r, entry - 3 * r
+        return entry + rr, entry + 2 * rr, entry + 3 * rr
+    return entry - rr, entry - 2 * rr, entry - 3 * rr
 
 
 def build_plan(label: str, symbol: str) -> Optional[Plan]:
@@ -527,6 +564,18 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
         return None
 
+    # RSI
+    rsi_val = float(rsi(m30["Close"], RSI_PERIOD).iloc[-1])
+    if pd.isna(rsi_val):
+        return None
+
+    if USE_RSI_FILTER:
+        if side == "BUY" and rsi_val > RSI_BUY_MAX:
+            return None
+        if side == "SELL" and rsi_val < RSI_SELL_MIN:
+            return None
+
+    # Smart money alignment
     liq_side = detect_liq_sweep_side(m30, a)
     bos_side = detect_bos_side(m30)
 
@@ -570,6 +619,20 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
 
     entry_type = "LIMIT"
     entry = mid
+
+    # Fibonacci filter
+    fib62 = fib79 = swing_high = swing_low = None
+    if USE_FIB_FILTER:
+        fib_data = fib_zone(m30, side, FIB_LOOKBACK)
+        if fib_data is None:
+            return None
+        fib62, fib79, swing_high, swing_low = fib_data
+
+        fib_min = min(fib62, fib79)
+        fib_max = max(fib62, fib79)
+
+        if not (fib_min <= entry <= fib_max):
+            return None
 
     strong_trend = abs(overall) == 2
 
@@ -621,8 +684,8 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     conf += 2 if zone_name in ("OrderBlock", "FVG") else 0
     conf += 1 if liq_aligned else 0
     conf += 1 if bos_aligned else 0
-    conf += 1 if entry_type == "MARKET" and bos_aligned else 0
-    conf += 1 if VIP_FILTER_PRO and liq_aligned and bos_aligned else 0
+    conf += 1 if USE_RSI_FILTER else 0
+    conf += 1 if USE_FIB_FILTER else 0
     conf = int(max(1, min(10, conf)))
 
     risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
@@ -649,6 +712,11 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         risk_usd=float(risk_usd),
         liq_side=liq_side,
         bos_side=bos_side,
+        rsi_value=float(rsi_val),
+        fib62=fib62,
+        fib79=fib79,
+        swing_high=swing_high,
+        swing_low=swing_low,
     )
 
 
@@ -677,13 +745,19 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
         rect = plt.Rectangle((x[i] - 0.32, y0), 0.64, max(y1 - y0, 1e-9), fill=False, linewidth=1)
         ax.add_patch(rect)
 
-    # EMA
+    # EMAs
     ax.plot(x, d["EMA_FAST"].values, linewidth=1.2, label=f"EMA{EMA_FAST}")
     ax.plot(x, d["EMA_SLOW"].values, linewidth=1.2, label=f"EMA{EMA_SLOW}")
 
     # Zone
     if plan.zone_low is not None and plan.zone_high is not None:
         ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.15)
+
+    # Fibonacci zone on chart
+    if plan.fib62 is not None and plan.fib79 is not None:
+        fib_min = min(plan.fib62, plan.fib79)
+        fib_max = max(plan.fib62, plan.fib79)
+        ax.axhspan(fib_min, fib_max, alpha=0.08)
 
     # Levels
     ax.axhline(plan.entry, linewidth=1.2, linestyle="--")
@@ -697,17 +771,19 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     ax.grid(True, alpha=0.2)
     ax.legend(loc="upper left", fontsize=9)
 
-    # X labels
     idx = d.index
     step = max(1, len(d) // 6)
     ticks = list(range(0, len(d), step))
     ax.set_xticks(ticks)
     ax.set_xticklabels([str(idx[i])[:16] for i in ticks], rotation=15, ha="right", fontsize=8)
 
-    # Technical analysis box
     zone_txt = "None"
     if plan.zone_low is not None and plan.zone_high is not None:
         zone_txt = f"{plan.zone_name} [{fmt_price(plan.label, plan.zone_low, plan.entry)} - {fmt_price(plan.label, plan.zone_high, plan.entry)}]"
+
+    fib_txt = "OFF"
+    if plan.fib62 is not None and plan.fib79 is not None:
+        fib_txt = f"{fmt_price(plan.label, min(plan.fib62, plan.fib79), plan.entry)} - {fmt_price(plan.label, max(plan.fib62, plan.fib79), plan.entry)}"
 
     liq_txt = plan.liq_side if plan.liq_side else "NO"
     bos_txt = plan.bos_side if plan.bos_side else "NO"
@@ -716,6 +792,8 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
         f"Analysis\n"
         f"D1/H4: {plan.trend_d1:+d}/{plan.trend_h4:+d} | Overall: {plan.overall:+d}\n"
         f"Liq: {liq_txt} | BOS: {bos_txt}\n"
+        f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
+        f"Fib zone: {fib_txt}\n"
         f"Zone: {zone_txt}\n"
         f"Entry: {fmt_price(plan.label, plan.entry, plan.entry)}\n"
         f"SL: {fmt_price(plan.label, plan.sl, plan.entry)}\n"
@@ -924,6 +1002,13 @@ def format_plan(plan: Plan) -> str:
             f"[{fmt_price(plan.label, plan.zone_low, px_hint)} - {fmt_price(plan.label, plan.zone_high, px_hint)}]"
         )
 
+    fib_txt = "OFF"
+    if plan.fib62 is not None and plan.fib79 is not None:
+        fib_txt = (
+            f"{fmt_price(plan.label, min(plan.fib62, plan.fib79), px_hint)} - "
+            f"{fmt_price(plan.label, max(plan.fib62, plan.fib79), px_hint)}"
+        )
+
     liq_txt = plan.liq_side if plan.liq_side is not None else "❌"
     bos_txt = plan.bos_side if plan.bos_side is not None else "❌"
 
@@ -931,7 +1016,9 @@ def format_plan(plan: Plan) -> str:
         f"🔥 VIP M30\n"
         f"📌 {plan.label} ({plan.symbol})\n"
         f"Trend D1/H4: {plan.trend_d1:+d} / {plan.trend_h4:+d} => Overall: {plan.overall:+d}\n"
-        f"Liq Sweep: {liq_txt} | BOS: {bos_txt}\n\n"
+        f"Liq Sweep: {liq_txt} | BOS: {bos_txt}\n"
+        f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
+        f"Fib Zone: {fib_txt}\n\n"
         f"{side_emoji} {order}: {fmt_price(plan.label, plan.entry, px_hint)}\n"
         f"SL: {fmt_price(plan.label, plan.sl, px_hint)}\n"
         f"TP1: {fmt_price(plan.label, plan.tp1, px_hint)}\n"
@@ -940,7 +1027,7 @@ def format_plan(plan: Plan) -> str:
         f"Zone: {zone_txt}\n"
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
         f"Confidence: {plan.confidence}/10\n"
-        f"Mode: {MODE} | VIP_FILTER_PRO={int(VIP_FILTER_PRO)} | SMART_ENTRY={int(SMART_ENTRY)}\n"
+        f"Mode: {MODE} | VIP_FILTER_PRO={int(VIP_FILTER_PRO)} | RSI={int(USE_RSI_FILTER)} | FIB={int(USE_FIB_FILTER)}\n"
     )
 
 
@@ -948,7 +1035,7 @@ def signal_hash(plan: Plan) -> str:
     key = (
         f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry}|{plan.sl}|"
         f"{plan.tp1}|{plan.tp2}|{plan.tp3}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}|"
-        f"liq={plan.liq_side}|bos={plan.bos_side}"
+        f"liq={plan.liq_side}|bos={plan.bos_side}|rsi={plan.rsi_value:.2f}|fib62={plan.fib62}|fib79={plan.fib79}"
     )
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
@@ -1045,6 +1132,8 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"MAX_ATR_PCT={MAX_ATR_PCT}\n"
             f"SMART_ENTRY={int(SMART_ENTRY)}\n"
             f"VIP_FILTER_PRO={int(VIP_FILTER_PRO)}\n"
+            f"USE_RSI_FILTER={int(USE_RSI_FILTER)} | RSI_BUY_MAX={RSI_BUY_MAX} | RSI_SELL_MIN={RSI_SELL_MIN}\n"
+            f"USE_FIB_FILTER={int(USE_FIB_FILTER)} | FIB_LOOKBACK={FIB_LOOKBACK}\n"
             f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
             f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
             f"ASIA_ALLOWED=XAU,XAG,US100,US30,GER40,OILCASH\n"
@@ -1113,11 +1202,8 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             return
 
         caption = format_plan(plan)
-
-        # text first
         tg_send_message(chat_id, caption)
 
-        # then technical chart
         img = render_chart(m30, plan)
         tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
 
@@ -1158,11 +1244,8 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
                 continue
 
             caption = f"🔥 TOP VIP SIGNAL #{i}\n\n" + format_plan(plan)
-
-            # text first
             tg_send_message(chat_id, caption)
 
-            # then chart
             img = render_chart(m30, plan)
             tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
 
@@ -1189,13 +1272,13 @@ def main():
 
     state = load_state()
     logger.info(
-        "VIP bot started. MODE=%s | VIP_FILTER_PRO=%s | SMART_ENTRY=%s | CHAT_ID=%s",
-        MODE, int(VIP_FILTER_PRO), int(SMART_ENTRY), CHAT_ID
+        "VIP bot started. MODE=%s | VIP_FILTER_PRO=%s | RSI=%s | FIB=%s | CHAT_ID=%s",
+        MODE, int(VIP_FILTER_PRO), int(USE_RSI_FILTER), int(USE_FIB_FILTER), CHAT_ID
     )
 
     tg_send_message(
         CHAT_ID,
-        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + Technical Chart). اكتب /help"
+        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + RSI + Fibonacci). اكتب /help"
     )
 
     last_check = 0.0
@@ -1240,11 +1323,8 @@ def main():
                     continue
 
                 caption = format_plan(plan)
-
-                # text first
                 tg_send_message(CHAT_ID, caption)
 
-                # then technical chart
                 img = render_chart(m30, plan)
                 tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
 
