@@ -54,11 +54,8 @@ EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 
-# Strong RSI filter
 RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "35"))
 RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "65"))
-
-# Fibonacci swing lookback
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "50"))
 
 LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "90d")
@@ -73,6 +70,7 @@ SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
 LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
 USE_RSI_FILTER = os.getenv("USE_RSI_FILTER", "1").strip() == "1"
 USE_FIB_FILTER = os.getenv("USE_FIB_FILTER", "1").strip() == "1"
+USE_CANDLE_CONFIRM = os.getenv("USE_CANDLE_CONFIRM", "1").strip() == "1"
 
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
 MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "8"))
@@ -335,13 +333,10 @@ def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
-
     rs = avg_gain / (avg_loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
@@ -401,6 +396,19 @@ def detect_bos_side(df: pd.DataFrame) -> Optional[str]:
     if last_c < swing_low:
         return "SELL"
     return None
+
+
+def candle_confirmation(df: pd.DataFrame, side: str) -> bool:
+    if df is None or len(df) < 5:
+        return False
+
+    last_close = float(df["Close"].iloc[-1])
+    prev_high = float(df["High"].iloc[-2])
+    prev_low = float(df["Low"].iloc[-2])
+
+    if side == "BUY":
+        return last_close > prev_high
+    return last_close < prev_low
 
 
 def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
@@ -519,6 +527,7 @@ class Plan:
     fib79: Optional[float]
     swing_high: Optional[float]
     swing_low: Optional[float]
+    candle_ok: bool
 
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
@@ -595,6 +604,10 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         if liq_side is not None and bos_side is not None and liq_side != bos_side:
             return None
 
+    candle_ok = candle_confirmation(m30, side)
+    if USE_CANDLE_CONFIRM and not candle_ok:
+        return None
+
     ob = find_orderblock(m30, side)
     fvg = find_fvg(m30, side)
 
@@ -637,13 +650,14 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         SMART_ENTRY
         and bos_aligned
         and strong_trend
+        and candle_ok
         and (dist_atr <= MARKET_ATR_MAX)
     )
 
     if LIQ_FAVOR_LIMIT and liq_aligned:
         allow_market = False
 
-    if VIP_FILTER_PRO and not (bos_aligned and strong_trend and dist_atr <= MARKET_ATR_MAX):
+    if VIP_FILTER_PRO and not (bos_aligned and strong_trend and dist_atr <= MARKET_ATR_MAX and candle_ok):
         allow_market = False
 
     if MODE == "vip_retest":
@@ -683,6 +697,7 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     conf += 1 if bos_aligned else 0
     conf += 1 if USE_RSI_FILTER else 0
     conf += 1 if USE_FIB_FILTER else 0
+    conf += 1 if candle_ok else 0
     conf = int(max(1, min(10, conf)))
 
     risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
@@ -714,6 +729,7 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         fib79=fib79,
         swing_high=swing_high,
         swing_low=swing_low,
+        candle_ok=bool(candle_ok),
     )
 
 
@@ -731,7 +747,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     l = d["Low"].values
     c = d["Close"].values
 
-    fig = plt.figure(figsize=(12, 7), dpi=150)
+    fig = plt.figure(figsize=(10, 6), dpi=120)
     ax = plt.gca()
 
     for i in range(len(d)):
@@ -779,6 +795,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
 
     liq_txt = plan.liq_side if plan.liq_side else "NO"
     bos_txt = plan.bos_side if plan.bos_side else "NO"
+    candle_txt = "YES" if plan.candle_ok else "NO"
 
     analysis_text = (
         f"Analysis\n"
@@ -786,6 +803,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
         f"Liq: {liq_txt} | BOS: {bos_txt}\n"
         f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
         f"Fib zone: {fib_txt}\n"
+        f"Candle confirm: {candle_txt}\n"
         f"Zone: {zone_txt}\n"
         f"Entry: {fmt_price(plan.label, plan.entry, plan.entry)}\n"
         f"SL: {fmt_price(plan.label, plan.sl, plan.entry)}\n"
@@ -927,7 +945,7 @@ def update_trade_outcomes(state: dict) -> None:
 
                     tg_send_message(
                         CHAT_ID,
-                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}\n✅ نقل الصفقة للمتابعة."
+                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}"
                     )
 
                     if not be_moved:
@@ -985,7 +1003,7 @@ def update_trade_outcomes(state: dict) -> None:
 
                     tg_send_message(
                         CHAT_ID,
-                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}\n✅ صفقة مكتملة"
+                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}"
                     )
                     break
 
@@ -1040,7 +1058,7 @@ def update_trade_outcomes(state: dict) -> None:
 
                     tg_send_message(
                         CHAT_ID,
-                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}\n✅ نقل الصفقة للمتابعة."
+                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}"
                     )
 
                     if not be_moved:
@@ -1098,7 +1116,7 @@ def update_trade_outcomes(state: dict) -> None:
 
                     tg_send_message(
                         CHAT_ID,
-                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}\n✅ صفقة مكتملة"
+                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}"
                     )
                     break
 
@@ -1198,12 +1216,13 @@ def format_plan(plan: Plan) -> str:
 
     liq_txt = plan.liq_side if plan.liq_side is not None else "❌"
     bos_txt = plan.bos_side if plan.bos_side is not None else "❌"
+    candle_txt = "✅" if plan.candle_ok else "❌"
 
     return (
         f"🔥 VIP M30\n"
         f"📌 {plan.label} ({plan.symbol})\n"
         f"Trend D1/H4: {plan.trend_d1:+d} / {plan.trend_h4:+d} => Overall: {plan.overall:+d}\n"
-        f"Liq Sweep: {liq_txt} | BOS: {bos_txt}\n"
+        f"Liq Sweep: {liq_txt} | BOS: {bos_txt} | Candle: {candle_txt}\n"
         f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
         f"Fib Zone: {fib_txt}\n\n"
         f"{side_emoji} {order}: {fmt_price(plan.label, plan.entry, px_hint)}\n"
@@ -1222,7 +1241,7 @@ def signal_hash(plan: Plan) -> str:
     key = (
         f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry}|{plan.sl}|"
         f"{plan.tp1}|{plan.tp2}|{plan.tp3}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}|"
-        f"liq={plan.liq_side}|bos={plan.bos_side}|rsi={plan.rsi_value:.2f}|fib62={plan.fib62}|fib79={plan.fib79}"
+        f"liq={plan.liq_side}|bos={plan.bos_side}|rsi={plan.rsi_value:.2f}|fib62={plan.fib62}|fib79={plan.fib79}|candle={plan.candle_ok}"
     )
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
@@ -1321,6 +1340,7 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"VIP_FILTER_PRO={int(VIP_FILTER_PRO)}\n"
             f"USE_RSI_FILTER={int(USE_RSI_FILTER)} | RSI_BUY_MAX={RSI_BUY_MAX} | RSI_SELL_MIN={RSI_SELL_MIN}\n"
             f"USE_FIB_FILTER={int(USE_FIB_FILTER)} | FIB_LOOKBACK={FIB_LOOKBACK}\n"
+            f"USE_CANDLE_CONFIRM={int(USE_CANDLE_CONFIRM)}\n"
             f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
             f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
             f"ASIA_ALLOWED=XAU,XAG,US100,US30,GER40,OILCASH\n"
@@ -1391,10 +1411,13 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         caption = format_plan(plan)
         tg_send_message(chat_id, caption)
 
-        img = render_chart(m30, plan)
-        photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
-        if not photo_ok:
-            tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+        try:
+            img = render_chart(m30, plan)
+            photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+            if not photo_ok:
+                tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+        except Exception as e:
+            tg_send_message(chat_id, f"⚠️ Chart error for {plan.label}: {e}")
 
         register_trade_for_daily(state, plan)
         save_state(state)
@@ -1435,10 +1458,13 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             caption = f"🔥 TOP VIP SIGNAL #{i}\n\n" + format_plan(plan)
             tg_send_message(chat_id, caption)
 
-            img = render_chart(m30, plan)
-            photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
-            if not photo_ok:
-                tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+            try:
+                img = render_chart(m30, plan)
+                photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+                if not photo_ok:
+                    tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+            except Exception as e:
+                tg_send_message(chat_id, f"⚠️ Chart error for {plan.label}: {e}")
 
             register_trade_for_daily(state, plan)
             save_state(state)
@@ -1463,13 +1489,13 @@ def main():
 
     state = load_state()
     logger.info(
-        "VIP bot started. MODE=%s | VIP_FILTER_PRO=%s | RSI=%s | FIB=%s | CHAT_ID=%s",
-        MODE, int(VIP_FILTER_PRO), int(USE_RSI_FILTER), int(USE_FIB_FILTER), CHAT_ID
+        "VIP bot started. MODE=%s | VIP_FILTER_PRO=%s | RSI=%s | FIB=%s | CANDLE=%s | CHAT_ID=%s",
+        MODE, int(VIP_FILTER_PRO), int(USE_RSI_FILTER), int(USE_FIB_FILTER), int(USE_CANDLE_CONFIRM), CHAT_ID
     )
 
     tg_send_message(
         CHAT_ID,
-        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + RSI + Fibonacci + BE). اكتب /help"
+        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + RSI + Fibonacci + Candle Confirm + BE). اكتب /help"
     )
 
     last_check = 0.0
@@ -1516,10 +1542,13 @@ def main():
                 caption = format_plan(plan)
                 tg_send_message(CHAT_ID, caption)
 
-                img = render_chart(m30, plan)
-                photo_ok = tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
-                if not photo_ok:
-                    tg_send_message(CHAT_ID, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+                try:
+                    img = render_chart(m30, plan)
+                    photo_ok = tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
+                    if not photo_ok:
+                        tg_send_message(CHAT_ID, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+                except Exception as e:
+                    tg_send_message(CHAT_ID, f"⚠️ Chart error for {plan.label}: {e}")
 
                 mark_sent(state, plan)
                 register_trade_for_daily(state, plan)
