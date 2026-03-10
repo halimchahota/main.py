@@ -468,14 +468,6 @@ def find_fvg(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
 
 
 def fib_zone(df: pd.DataFrame, side: str, lookback: int = 50) -> Optional[Tuple[float, float, float, float]]:
-    """
-    Returns:
-    buy side -> (fib62, fib79, swing_high, swing_low)
-    sell side -> (fib62, fib79, swing_high, swing_low)
-
-    For BUY: we want retracement inside lower zone of bullish leg.
-    For SELL: we want retracement inside upper zone of bearish leg.
-    """
     if df is None or len(df) < lookback + 5:
         return None
 
@@ -530,11 +522,19 @@ class Plan:
 
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
-    rr = abs(entry - sl)
-    rr = max(rr, 1e-9)
+    r = abs(entry - sl)
+    r = max(r, 1e-9)
+
     if side == "BUY":
-        return entry + rr, entry + 2 * rr, entry + 3 * rr
-    return entry - rr, entry - 2 * rr, entry - 3 * rr
+        tp1 = entry + (2 * r)
+        tp2 = entry + (3 * r)
+        tp3 = entry + (4 * r)
+    else:
+        tp1 = entry - (2 * r)
+        tp2 = entry - (3 * r)
+        tp3 = entry - (4 * r)
+
+    return tp1, tp2, tp3
 
 
 def build_plan(label: str, symbol: str) -> Optional[Plan]:
@@ -564,7 +564,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
         return None
 
-    # RSI
     rsi_val = float(rsi(m30["Close"], RSI_PERIOD).iloc[-1])
     if pd.isna(rsi_val):
         return None
@@ -575,7 +574,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
         if side == "SELL" and rsi_val < RSI_SELL_MIN:
             return None
 
-    # Smart money alignment
     liq_side = detect_liq_sweep_side(m30, a)
     bos_side = detect_bos_side(m30)
 
@@ -620,7 +618,6 @@ def build_plan(label: str, symbol: str) -> Optional[Plan]:
     entry_type = "LIMIT"
     entry = mid
 
-    # Fibonacci filter
     fib62 = fib79 = swing_high = swing_low = None
     if USE_FIB_FILTER:
         fib_data = fib_zone(m30, side, FIB_LOOKBACK)
@@ -737,7 +734,6 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     fig = plt.figure(figsize=(12, 7), dpi=150)
     ax = plt.gca()
 
-    # Candles
     for i in range(len(d)):
         ax.plot([x[i], x[i]], [l[i], h[i]], linewidth=1)
         y0 = min(o[i], c[i])
@@ -745,21 +741,17 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
         rect = plt.Rectangle((x[i] - 0.32, y0), 0.64, max(y1 - y0, 1e-9), fill=False, linewidth=1)
         ax.add_patch(rect)
 
-    # EMAs
     ax.plot(x, d["EMA_FAST"].values, linewidth=1.2, label=f"EMA{EMA_FAST}")
     ax.plot(x, d["EMA_SLOW"].values, linewidth=1.2, label=f"EMA{EMA_SLOW}")
 
-    # Zone
     if plan.zone_low is not None and plan.zone_high is not None:
         ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.15)
 
-    # Fibonacci zone on chart
     if plan.fib62 is not None and plan.fib79 is not None:
         fib_min = min(plan.fib62, plan.fib79)
         fib_max = max(plan.fib62, plan.fib79)
         ax.axhspan(fib_min, fib_max, alpha=0.08)
 
-    # Levels
     ax.axhline(plan.entry, linewidth=1.2, linestyle="--")
     ax.axhline(plan.sl, linewidth=1.2, linestyle="--")
     ax.axhline(plan.tp1, linewidth=1.0, linestyle=":")
@@ -839,10 +831,16 @@ def register_trade_for_daily(state: dict, plan: Plan) -> str:
         "side": plan.side,
         "entry": float(plan.entry),
         "sl": float(plan.sl),
+        "initial_sl": float(plan.sl),
         "tp1": float(plan.tp1),
         "tp2": float(plan.tp2),
         "tp3": float(plan.tp3),
         "status": "OPEN",
+        "tp1_done": False,
+        "tp2_done": False,
+        "tp3_done": False,
+        "be_moved": False,
+        "last_event": "",
     }
 
     day = _utc_date_str(now)
@@ -870,10 +868,13 @@ def update_trade_outcomes(state: dict) -> None:
         return
 
     for tid, tr in list(open_trades.items()):
-        if tr.get("status") != "OPEN":
+        if tr.get("status") == "CLOSED":
             continue
 
         symbol = tr.get("symbol")
+        label = tr.get("label", symbol)
+        side = tr.get("side", "BUY")
+
         df = yf_download_safe(symbol, "5d", "30m")
         if df is None or df.empty:
             continue
@@ -890,60 +891,246 @@ def update_trade_outcomes(state: dict) -> None:
         if df2.empty:
             continue
 
+        entry = float(tr["entry"])
         sl = float(tr["sl"])
         tp1 = float(tr["tp1"])
         tp2 = float(tr["tp2"])
         tp3 = float(tr["tp3"])
 
-        resolved = None
+        tp1_done = bool(tr.get("tp1_done", False))
+        tp2_done = bool(tr.get("tp2_done", False))
+        tp3_done = bool(tr.get("tp3_done", False))
+        be_moved = bool(tr.get("be_moved", False))
+
         for _, row in df2.iterrows():
             hi = float(row["High"])
             lo = float(row["Low"])
 
-            sl_hit = _hit_in_bar(hi, lo, sl)
-            tp1_hit = _hit_in_bar(hi, lo, tp1)
-            tp2_hit = _hit_in_bar(hi, lo, tp2)
-            tp3_hit = _hit_in_bar(hi, lo, tp3)
+            if side == "BUY":
+                if (not tp1_done) and (hi >= tp1):
+                    tr["tp1_done"] = True
+                    tp1_done = True
 
-            if sl_hit:
-                resolved = "SL"
-                break
-            if tp3_hit:
-                resolved = "TP3"
-                break
-            if tp2_hit:
-                resolved = "TP2"
-                break
-            if tp1_hit:
-                resolved = "TP1"
-                break
-
-        if resolved:
-            tr["status"] = resolved
-            day = tr.get("date") or _utc_date_str(ts)
-            daily = state.setdefault("daily", {}).setdefault(day, {
-                "signals": 0,
-                "avg_conf_sum": 0,
-                "avg_conf_n": 0,
-                "wins": 0,
-                "losses": 0,
-                "tp1": 0,
-                "tp2": 0,
-                "tp3": 0,
-                "open": 0,
-            })
-            daily["open"] = max(0, int(daily["open"]) - 1)
-
-            if resolved == "SL":
-                daily["losses"] += 1
-            else:
-                daily["wins"] += 1
-                if resolved == "TP1":
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
                     daily["tp1"] += 1
-                elif resolved == "TP2":
+
+                    tg_send_message(
+                        CHAT_ID,
+                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}\n✅ نقل الصفقة للمتابعة."
+                    )
+
+                    if not be_moved:
+                        tr["sl"] = entry
+                        tr["be_moved"] = True
+                        sl = entry
+                        be_moved = True
+                        tg_send_message(
+                            CHAT_ID,
+                            f"🛡 BreakEven Activated\n{label}\nSL moved to Entry: {entry}"
+                        )
+
+                if tp1_done and (not tp2_done) and (hi >= tp2):
+                    tr["tp2_done"] = True
+                    tp2_done = True
+
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
                     daily["tp2"] += 1
-                elif resolved == "TP3":
+
+                    tg_send_message(
+                        CHAT_ID,
+                        f"🚀 TP2 HIT\n{label}\nTP2: {tp2}"
+                    )
+
+                if tp2_done and (not tp3_done) and (hi >= tp3):
+                    tr["tp3_done"] = True
+                    tr["status"] = "CLOSED"
+
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
                     daily["tp3"] += 1
+                    daily["wins"] += 1
+                    daily["open"] = max(0, int(daily["open"]) - 1)
+
+                    tg_send_message(
+                        CHAT_ID,
+                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}\n✅ صفقة مكتملة"
+                    )
+                    break
+
+                if lo <= sl:
+                    tr["status"] = "CLOSED"
+
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
+                    daily["open"] = max(0, int(daily["open"]) - 1)
+
+                    if be_moved:
+                        tg_send_message(
+                            CHAT_ID,
+                            f"⚖️ BreakEven Exit\n{label}\nExit at Entry: {entry}"
+                        )
+                    else:
+                        daily["losses"] += 1
+                        tg_send_message(
+                            CHAT_ID,
+                            f"❌ SL HIT\n{label}\nSL: {sl}"
+                        )
+                    break
+
+            else:
+                if (not tp1_done) and (lo <= tp1):
+                    tr["tp1_done"] = True
+                    tp1_done = True
+
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
+                    daily["tp1"] += 1
+
+                    tg_send_message(
+                        CHAT_ID,
+                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}\n✅ نقل الصفقة للمتابعة."
+                    )
+
+                    if not be_moved:
+                        tr["sl"] = entry
+                        tr["be_moved"] = True
+                        sl = entry
+                        be_moved = True
+                        tg_send_message(
+                            CHAT_ID,
+                            f"🛡 BreakEven Activated\n{label}\nSL moved to Entry: {entry}"
+                        )
+
+                if tp1_done and (not tp2_done) and (lo <= tp2):
+                    tr["tp2_done"] = True
+                    tp2_done = True
+
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
+                    daily["tp2"] += 1
+
+                    tg_send_message(
+                        CHAT_ID,
+                        f"🚀 TP2 HIT\n{label}\nTP2: {tp2}"
+                    )
+
+                if tp2_done and (not tp3_done) and (lo <= tp3):
+                    tr["tp3_done"] = True
+                    tr["status"] = "CLOSED"
+
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
+                    daily["tp3"] += 1
+                    daily["wins"] += 1
+                    daily["open"] = max(0, int(daily["open"]) - 1)
+
+                    tg_send_message(
+                        CHAT_ID,
+                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}\n✅ صفقة مكتملة"
+                    )
+                    break
+
+                if hi >= sl:
+                    tr["status"] = "CLOSED"
+
+                    day = tr.get("date") or _utc_date_str(ts)
+                    daily = state.setdefault("daily", {}).setdefault(day, {
+                        "signals": 0,
+                        "avg_conf_sum": 0,
+                        "avg_conf_n": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "tp3": 0,
+                        "open": 0,
+                    })
+                    daily["open"] = max(0, int(daily["open"]) - 1)
+
+                    if be_moved:
+                        tg_send_message(
+                            CHAT_ID,
+                            f"⚖️ BreakEven Exit\n{label}\nExit at Entry: {entry}"
+                        )
+                    else:
+                        daily["losses"] += 1
+                        tg_send_message(
+                            CHAT_ID,
+                            f"❌ SL HIT\n{label}\nSL: {sl}"
+                        )
+                    break
 
 
 def format_daily_report(state: dict, day: Optional[str] = None) -> str:
@@ -1205,7 +1392,9 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         tg_send_message(chat_id, caption)
 
         img = render_chart(m30, plan)
-        tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+        photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+        if not photo_ok:
+            tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
 
         register_trade_for_daily(state, plan)
         save_state(state)
@@ -1247,7 +1436,9 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             tg_send_message(chat_id, caption)
 
             img = render_chart(m30, plan)
-            tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+            photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+            if not photo_ok:
+                tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
 
             register_trade_for_daily(state, plan)
             save_state(state)
@@ -1278,7 +1469,7 @@ def main():
 
     tg_send_message(
         CHAT_ID,
-        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + RSI + Fibonacci). اكتب /help"
+        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + RSI + Fibonacci + BE). اكتب /help"
     )
 
     last_check = 0.0
@@ -1326,7 +1517,9 @@ def main():
                 tg_send_message(CHAT_ID, caption)
 
                 img = render_chart(m30, plan)
-                tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
+                photo_ok = tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
+                if not photo_ok:
+                    tg_send_message(CHAT_ID, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
 
                 mark_sent(state, plan)
                 register_trade_for_daily(state, plan)
