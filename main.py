@@ -3,6 +3,7 @@ import os
 import io
 import time
 import json
+import math
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -24,11 +25,11 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("vip_bot")
+logger = logging.getLogger("adaptive_quant_bot")
 
 
 # =========================
-# ENV / CONFIG
+# CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
@@ -39,41 +40,33 @@ RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 
-MODE = os.getenv("MODE", "vip_retest").strip().lower()  # vip_retest | vip_mix
-
-RETEST_ATR = float(os.getenv("RETEST_ATR", "0.40"))
-MAX_PENDING_DISTANCE_ATR = float(os.getenv("MAX_PENDING_DISTANCE_ATR", "1.50"))
-MARKET_ATR_MAX = float(os.getenv("MARKET_ATR_MAX", "0.25"))
-SL_BUFFER_ATR = float(os.getenv("SL_BUFFER_ATR", "0.20"))
-MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.006"))
-
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 UPDATES_TIMEOUT = 30
+
+LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "120d")
+LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "90d")
+LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "20d")
 
 EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-
-RSI_BUY_MAX = float(os.getenv("RSI_BUY_MAX", "35"))
-RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "65"))
-FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "50"))
-
-LOOKBACK_D1 = os.getenv("LOOKBACK_D1", "90d")
-LOOKBACK_H4 = os.getenv("LOOKBACK_H4", "60d")
-LOOKBACK_M30 = os.getenv("LOOKBACK_M30", "15d")
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+MACD_FAST = int(os.getenv("MACD_FAST", "12"))
+MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
+MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
 
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
 
-USE_LIQ_BOS = os.getenv("USE_LIQ_BOS", "1").strip() == "1"
-VIP_FILTER_PRO = os.getenv("VIP_FILTER_PRO", "1").strip() == "1"
-SMART_ENTRY = os.getenv("SMART_ENTRY", "1").strip() == "1"
-LIQ_FAVOR_LIMIT = os.getenv("LIQ_FAVOR_LIMIT", "1").strip() == "1"
-USE_RSI_FILTER = os.getenv("USE_RSI_FILTER", "1").strip() == "1"
-USE_FIB_FILTER = os.getenv("USE_FIB_FILTER", "1").strip() == "1"
-USE_CANDLE_CONFIRM = os.getenv("USE_CANDLE_CONFIRM", "1").strip() == "1"
+MIN_SCORE_TO_SIGNAL = float(os.getenv("MIN_SCORE_TO_SIGNAL", "7.2"))
+MIN_SCORE_GAP = float(os.getenv("MIN_SCORE_GAP", "1.4"))
 
-SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
-MIN_CONF_SCAN = int(os.getenv("MIN_CONF_SCAN", "8"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.010"))
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.0005"))
+
+SR_LOOKBACK = int(os.getenv("SR_LOOKBACK", "60"))
+FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "50"))
+MOMENTUM_BARS = int(os.getenv("MOMENTUM_BARS", "6"))
+VOLUME_LOOKBACK = int(os.getenv("VOLUME_LOOKBACK", "20"))
 
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))
 DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))
@@ -82,12 +75,17 @@ USE_SESSION_FILTER = os.getenv("USE_SESSION_FILTER", "0").strip() == "1"
 SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
 
-CRYPTO_LABELS = {"BTC"}
+SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
+MIN_CONF_SCAN = float(os.getenv("MIN_CONF_SCAN", "7.5"))
 
+# adaptive learning
+LEARN_RATE_WIN = float(os.getenv("LEARN_RATE_WIN", "0.08"))
+LEARN_RATE_LOSS = float(os.getenv("LEARN_RATE_LOSS", "0.06"))
+LEARN_RATE_BE = float(os.getenv("LEARN_RATE_BE", "0.02"))
+WEIGHT_MIN = float(os.getenv("WEIGHT_MIN", "0.40"))
+WEIGHT_MAX = float(os.getenv("WEIGHT_MAX", "2.20"))
 
-# =========================
-# SYMBOLS
-# =========================
+# symbols
 SYMBOLS: Dict[str, str] = {
     "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
     "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
@@ -100,26 +98,20 @@ SYMBOLS: Dict[str, str] = {
     "USDJPY": os.getenv("USDJPY_SYMBOL", "USDJPY=X"),
 }
 
+CRYPTO_LABELS = {"BTC"}
+
 TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
 # =========================
-# SESSION / MARKET FILTERS
+# HELPERS
 # =========================
 def is_crypto_label(label: str) -> bool:
     return label.upper() in CRYPTO_LABELS
 
 
-def is_asia_allowed_label(label: str) -> bool:
-    asia_allowed = {
-        "XAU",
-        "XAG",
-        "US100",
-        "US30",
-        "GER40",
-        "OILCASH",
-    }
-    return label.upper() in asia_allowed
+def is_weekend_utc() -> bool:
+    return time.gmtime().tm_wday in (5, 6)
 
 
 def session_allowed_for_symbol(label: str) -> bool:
@@ -127,16 +119,8 @@ def session_allowed_for_symbol(label: str) -> bool:
         return True
     if is_crypto_label(label):
         return True
-    if is_asia_allowed_label(label):
-        return True
-
     hour = time.gmtime().tm_hour
     return SESSION_START_UTC <= hour < SESSION_END_UTC
-
-
-def is_weekend_utc() -> bool:
-    wd = time.gmtime().tm_wday
-    return wd in (5, 6)
 
 
 def market_is_open_for_symbol(label: str) -> bool:
@@ -145,27 +129,35 @@ def market_is_open_for_symbol(label: str) -> bool:
     return not is_weekend_utc()
 
 
-# =========================
-# PRICE FORMAT
-# =========================
+def _utc_date_str(ts: Optional[float] = None) -> str:
+    ts = ts if ts is not None else time.time()
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def safe_float(x, default=0.0) -> float:
+    try:
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
 def price_decimals(label: str, px: float) -> int:
     label = (label or "").upper()
     if "JPY" in label:
         return 3
-
-    fx_5 = {
-        "EURUSD", "GBPUSD", "AUDUSD", "USDCHF", "USDCAD", "NZDUSD",
-        "EURGBP", "EURCHF", "EURAUD", "EURCAD", "GBPCHF"
-    }
-    if label in fx_5:
+    if label in {"EURUSD", "GBPUSD", "AUDUSD", "USDCHF", "USDCAD", "NZDUSD"}:
         return 5
-
-    if label in ("BTC", "ETH"):
+    if label in {"BTC"}:
         return 2
-
-    if label in ("XAU", "XAG"):
+    if label in {"XAU", "XAG"}:
         return 2
-
     return 2 if abs(px) >= 100 else 5
 
 
@@ -176,9 +168,15 @@ def fmt_price(label: str, x: float, px_hint: float) -> str:
 # =========================
 # STATE
 # =========================
-def _utc_date_str(ts: Optional[float] = None) -> str:
-    ts = ts if ts is not None else time.time()
-    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+DEFAULT_FEATURE_WEIGHTS = {
+    "rsi": 1.00,
+    "macd": 1.00,
+    "volume": 0.90,
+    "momentum": 1.00,
+    "volatility": 0.80,
+    "fibonacci": 1.10,
+    "sr": 1.10,
+}
 
 
 def load_state() -> dict:
@@ -192,6 +190,8 @@ def load_state() -> dict:
                 st.setdefault("open_trades", {})
                 st.setdefault("daily", {})
                 st.setdefault("last_report_date", "")
+                st.setdefault("weights_global", DEFAULT_FEATURE_WEIGHTS.copy())
+                st.setdefault("weights_symbol", {})
                 return st
     except Exception as e:
         logger.warning("Failed to load state: %s", e)
@@ -203,6 +203,8 @@ def load_state() -> dict:
         "open_trades": {},
         "daily": {},
         "last_report_date": "",
+        "weights_global": DEFAULT_FEATURE_WEIGHTS.copy(),
+        "weights_symbol": {},
     }
 
 
@@ -213,6 +215,48 @@ def save_state(state: dict) -> None:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning("Failed to save state: %s", e)
+
+
+def get_symbol_weights(state: dict, label: str) -> dict:
+    state.setdefault("weights_global", DEFAULT_FEATURE_WEIGHTS.copy())
+    state.setdefault("weights_symbol", {})
+    if label not in state["weights_symbol"]:
+        state["weights_symbol"][label] = DEFAULT_FEATURE_WEIGHTS.copy()
+    out = {}
+    for k in DEFAULT_FEATURE_WEIGHTS.keys():
+        g = safe_float(state["weights_global"].get(k, DEFAULT_FEATURE_WEIGHTS[k]), DEFAULT_FEATURE_WEIGHTS[k])
+        s = safe_float(state["weights_symbol"][label].get(k, DEFAULT_FEATURE_WEIGHTS[k]), DEFAULT_FEATURE_WEIGHTS[k])
+        out[k] = (g + s) / 2.0
+    return out
+
+
+def update_weights_after_trade(state: dict, label: str, features_used: dict, outcome: str) -> None:
+    state.setdefault("weights_global", DEFAULT_FEATURE_WEIGHTS.copy())
+    state.setdefault("weights_symbol", {})
+    state["weights_symbol"].setdefault(label, DEFAULT_FEATURE_WEIGHTS.copy())
+
+    if outcome == "WIN":
+        lr = LEARN_RATE_WIN
+        direction = 1.0
+    elif outcome == "LOSS":
+        lr = LEARN_RATE_LOSS
+        direction = -1.0
+    else:
+        lr = LEARN_RATE_BE
+        direction = 0.5
+
+    for k, raw_score in features_used.items():
+        strength = abs(safe_float(raw_score))
+        if strength <= 0:
+            continue
+
+        delta = lr * strength * direction
+
+        g = safe_float(state["weights_global"].get(k, DEFAULT_FEATURE_WEIGHTS[k]), DEFAULT_FEATURE_WEIGHTS[k])
+        s = safe_float(state["weights_symbol"][label].get(k, DEFAULT_FEATURE_WEIGHTS[k]), DEFAULT_FEATURE_WEIGHTS[k])
+
+        state["weights_global"][k] = clamp(g + (delta * 0.35), WEIGHT_MIN, WEIGHT_MAX)
+        state["weights_symbol"][label][k] = clamp(s + (delta * 0.65), WEIGHT_MIN, WEIGHT_MAX)
 
 
 # =========================
@@ -249,11 +293,7 @@ def tg_get_me() -> Optional[dict]:
 
 def tg_send_message(chat_id: str, text: str) -> bool:
     try:
-        payload = {
-            "chat_id": chat_id,
-            "text": text[:4096],
-            "disable_web_page_preview": True,
-        }
+        payload = {"chat_id": chat_id, "text": text[:4096], "disable_web_page_preview": True}
         r = requests.post(tg_url("sendMessage"), json=payload, timeout=REQUEST_TIMEOUT)
         if not r.ok:
             logger.error("sendMessage failed: %s | %s", r.status_code, r.text[:300])
@@ -294,21 +334,20 @@ def tg_get_updates(offset: int) -> dict:
 
 
 # =========================
-# MARKET DATA
+# DATA + INDICATORS
 # =========================
 def yf_download_safe(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
     try:
         df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
         if df is None or df.empty:
             return None
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0] for c in df.columns]
-
         needed = {"Open", "High", "Low", "Close"}
         if not needed.issubset(df.columns):
             return None
-
+        if "Volume" not in df.columns:
+            df["Volume"] = 0.0
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
         if df.empty:
             return None
@@ -341,159 +380,223 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def last_price(df: pd.DataFrame) -> float:
-    return float(df["Close"].iloc[-1])
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    fast_ema = ema(series, fast)
+    slow_ema = ema(series, slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
 
-def trend_score(df: pd.DataFrame) -> int:
-    c = df["Close"]
-    if len(c) < max(EMA_FAST, EMA_SLOW) + 10:
-        return 0
-
-    f = ema(c, EMA_FAST)
-    s = ema(c, EMA_SLOW)
-    slope = (f.iloc[-1] - f.iloc[-6]) / (abs(f.iloc[-6]) + 1e-9)
-
-    if f.iloc[-1] > s.iloc[-1] and slope > 0:
-        return +1
-    if f.iloc[-1] < s.iloc[-1] and slope < 0:
-        return -1
-    return 0
-
-
-# =========================
-# SMART MONEY DETECTION
-# =========================
-def detect_liq_sweep_side(df: pd.DataFrame, a: float) -> Optional[str]:
-    if df is None or len(df) < 60 or a <= 0:
-        return None
-
-    d = df.tail(80).copy()
-    hi20 = float(d["High"].iloc[-21:-1].max())
-    lo20 = float(d["Low"].iloc[-21:-1].min())
-    last_h = float(d["High"].iloc[-1])
-    last_l = float(d["Low"].iloc[-1])
-    last_c = float(d["Close"].iloc[-1])
-
-    if (last_l < lo20 - 0.05 * a) and (last_c > lo20):
-        return "BUY"
-    if (last_h > hi20 + 0.05 * a) and (last_c < hi20):
-        return "SELL"
-    return None
-
-
-def detect_bos_side(df: pd.DataFrame) -> Optional[str]:
-    if df is None or len(df) < 60:
-        return None
-
-    d = df.tail(80).copy()
-    swing_high = float(d["High"].iloc[-21:-2].max())
-    swing_low = float(d["Low"].iloc[-21:-2].min())
-    last_c = float(d["Close"].iloc[-1])
-
-    if last_c > swing_high:
-        return "BUY"
-    if last_c < swing_low:
-        return "SELL"
-    return None
-
-
-def candle_confirmation(df: pd.DataFrame, side: str) -> bool:
-    if df is None or len(df) < 5:
-        return False
-
-    last_close = float(df["Close"].iloc[-1])
-    prev_high = float(df["High"].iloc[-2])
-    prev_low = float(df["Low"].iloc[-2])
-
-    if side == "BUY":
-        return last_close > prev_high
-    return last_close < prev_low
-
-
-def find_orderblock(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
-    if len(df) < 60:
-        return None
-
-    d = df.tail(90).copy()
-    a = atr(d, 14).iloc[-1]
-    if a is None or pd.isna(a) or a <= 0:
-        return None
-    a = float(a)
-
-    o = d["Open"].values
-    c = d["Close"].values
-    h = d["High"].values
-    l = d["Low"].values
-
-    for i in range(len(d) - 10, 10, -1):
-        body = abs(c[i] - o[i])
-        if body < 0.8 * a:
-            continue
-
-        if direction == "BUY":
-            if c[i] > o[i] and c[i] > h[i - 1] and c[i - 1] < o[i - 1]:
-                return float(l[i - 1]), float(h[i - 1])
-        else:
-            if c[i] < o[i] and c[i] < l[i - 1] and c[i - 1] > o[i - 1]:
-                return float(l[i - 1]), float(h[i - 1])
-    return None
-
-
-def find_fvg(df: pd.DataFrame, direction: str) -> Optional[Tuple[float, float]]:
-    if len(df) < 60:
-        return None
-
-    d = df.tail(160).copy().reset_index(drop=True)
-    px = float(d["Close"].iloc[-1])
-
-    zones = []
-    for i in range(2, len(d) - 2):
-        h_prev2 = float(d.loc[i - 2, "High"])
-        l_prev2 = float(d.loc[i - 2, "Low"])
-        h_i = float(d.loc[i, "High"])
-        l_i = float(d.loc[i, "Low"])
-
-        if direction == "BUY":
-            if l_i > h_prev2:
-                zones.append((h_prev2, l_i))
-        else:
-            if h_i < l_prev2:
-                zones.append((h_i, l_prev2))
-
-    if not zones:
-        return None
-
-    best = None
-    best_d = 1e18
-    for z0, z1 in zones[-25:]:
-        mid = (z0 + z1) / 2.0
-        dist = abs(px - mid)
-        if dist < best_d:
-            best_d = dist
-            best = (float(min(z0, z1)), float(max(z0, z1)))
-    return best
+def find_support_resistance(df: pd.DataFrame, lookback: int = 60) -> Tuple[float, float]:
+    d = df.tail(lookback)
+    support = float(d["Low"].min())
+    resistance = float(d["High"].max())
+    return support, resistance
 
 
 def fib_zone(df: pd.DataFrame, side: str, lookback: int = 50) -> Optional[Tuple[float, float, float, float]]:
     if df is None or len(df) < lookback + 5:
         return None
-
-    d = df.tail(lookback).copy()
+    d = df.tail(lookback)
     swing_high = float(d["High"].max())
     swing_low = float(d["Low"].min())
     rng = swing_high - swing_low
     if rng <= 0:
         return None
-
     if side == "BUY":
         fib62 = swing_high - rng * 0.618
         fib79 = swing_high - rng * 0.786
     else:
         fib62 = swing_low + rng * 0.618
         fib79 = swing_low + rng * 0.786
-
     return float(fib62), float(fib79), swing_high, swing_low
+
+
+# =========================
+# SCORING ENGINE
+# =========================
+def trend_bias_from_higher_tf(d1: pd.DataFrame, h4: pd.DataFrame) -> int:
+    d1_fast = ema(d1["Close"], EMA_FAST)
+    d1_slow = ema(d1["Close"], EMA_SLOW)
+    h4_fast = ema(h4["Close"], EMA_FAST)
+    h4_slow = ema(h4["Close"], EMA_SLOW)
+
+    score = 0
+    if d1_fast.iloc[-1] > d1_slow.iloc[-1]:
+        score += 1
+    elif d1_fast.iloc[-1] < d1_slow.iloc[-1]:
+        score -= 1
+
+    if h4_fast.iloc[-1] > h4_slow.iloc[-1]:
+        score += 1
+    elif h4_fast.iloc[-1] < h4_slow.iloc[-1]:
+        score -= 1
+    return score
+
+
+def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label: str) -> dict:
+    close = m30["Close"]
+    volume = m30["Volume"].fillna(0)
+
+    last_close = safe_float(close.iloc[-1])
+    last_atr = safe_float(atr(m30, ATR_PERIOD).iloc[-1])
+    atr_pct = last_atr / (abs(last_close) + 1e-9)
+
+    rsi_series = rsi(close, RSI_PERIOD)
+    last_rsi = safe_float(rsi_series.iloc[-1], 50.0)
+
+    macd_line, signal_line, hist = macd(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    last_macd = safe_float(macd_line.iloc[-1])
+    last_signal = safe_float(signal_line.iloc[-1])
+    prev_macd = safe_float(macd_line.iloc[-2]) if len(macd_line) >= 2 else last_macd
+    prev_signal = safe_float(signal_line.iloc[-2]) if len(signal_line) >= 2 else last_signal
+    last_hist = safe_float(hist.iloc[-1])
+
+    vol_ma = safe_float(volume.tail(VOLUME_LOOKBACK).mean(), 0.0)
+    last_vol = safe_float(volume.iloc[-1], 0.0)
+    vol_ratio = (last_vol / (vol_ma + 1e-9)) if vol_ma > 0 else 1.0
+
+    momentum_val = safe_float(last_close - safe_float(close.iloc[-1 - min(MOMENTUM_BARS, len(close)-1)]), 0.0)
+
+    support, resistance = find_support_resistance(m30, SR_LOOKBACK)
+    dist_to_support = abs(last_close - support) / (last_atr + 1e-9)
+    dist_to_resistance = abs(last_close - resistance) / (last_atr + 1e-9)
+
+    trend_bias = trend_bias_from_higher_tf(d1, h4)
+
+    # RSI score
+    buy_rsi = 0.0
+    sell_rsi = 0.0
+    if last_rsi <= 30:
+        buy_rsi = 1.8
+    elif last_rsi <= 35:
+        buy_rsi = 1.2
+    elif last_rsi >= 70:
+        sell_rsi = 1.8
+    elif last_rsi >= 65:
+        sell_rsi = 1.2
+
+    # MACD score
+    buy_macd = 0.0
+    sell_macd = 0.0
+    if prev_macd <= prev_signal and last_macd > last_signal:
+        buy_macd = 1.6
+    elif prev_macd >= prev_signal and last_macd < last_signal:
+        sell_macd = 1.6
+    else:
+        if last_hist > 0:
+            buy_macd = 0.7
+        elif last_hist < 0:
+            sell_macd = 0.7
+
+    # Volume score
+    buy_volume = 0.0
+    sell_volume = 0.0
+    if vol_ratio >= 1.4:
+        if momentum_val > 0:
+            buy_volume = 1.2
+        elif momentum_val < 0:
+            sell_volume = 1.2
+
+    # Momentum score
+    buy_momentum = 0.0
+    sell_momentum = 0.0
+    if momentum_val > 0:
+        buy_momentum = 1.1
+    elif momentum_val < 0:
+        sell_momentum = 1.1
+
+    # Volatility score
+    buy_volatility = 0.0
+    sell_volatility = 0.0
+    if MIN_ATR_PCT <= atr_pct <= MAX_ATR_PCT:
+        buy_volatility = 0.8
+        sell_volatility = 0.8
+    else:
+        buy_volatility = -0.8
+        sell_volatility = -0.8
+
+    # Fibonacci score
+    buy_fib = 0.0
+    sell_fib = 0.0
+    buy_fib62 = buy_fib79 = buy_high = buy_low = None
+    sell_fib62 = sell_fib79 = sell_high = sell_low = None
+
+    fib_buy = fib_zone(m30, "BUY", FIB_LOOKBACK)
+    fib_sell = fib_zone(m30, "SELL", FIB_LOOKBACK)
+
+    if fib_buy:
+        buy_fib62, buy_fib79, buy_high, buy_low = fib_buy
+        lo = min(buy_fib62, buy_fib79)
+        hi = max(buy_fib62, buy_fib79)
+        if lo <= last_close <= hi:
+            buy_fib = 1.8
+
+    if fib_sell:
+        sell_fib62, sell_fib79, sell_high, sell_low = fib_sell
+        lo = min(sell_fib62, sell_fib79)
+        hi = max(sell_fib62, sell_fib79)
+        if lo <= last_close <= hi:
+            sell_fib = 1.8
+
+    # Support / Resistance score
+    buy_sr = 0.0
+    sell_sr = 0.0
+    if dist_to_support <= 1.0:
+        buy_sr = 1.5
+    if dist_to_resistance <= 1.0:
+        sell_sr = 1.5
+
+    # Higher timeframe bias
+    buy_bias = 0.0
+    sell_bias = 0.0
+    if trend_bias >= 2:
+        buy_bias = 1.2
+    elif trend_bias <= -2:
+        sell_bias = 1.2
+    elif trend_bias == 1:
+        buy_bias = 0.6
+    elif trend_bias == -1:
+        sell_bias = 0.6
+
+    return {
+        "meta": {
+            "last_close": last_close,
+            "atr": last_atr,
+            "atr_pct": atr_pct,
+            "support": support,
+            "resistance": resistance,
+            "rsi": last_rsi,
+            "vol_ratio": vol_ratio,
+            "trend_bias": trend_bias,
+            "buy_fib62": buy_fib62,
+            "buy_fib79": buy_fib79,
+            "sell_fib62": sell_fib62,
+            "sell_fib79": sell_fib79,
+        },
+        "buy": {
+            "rsi": buy_rsi,
+            "macd": buy_macd,
+            "volume": buy_volume,
+            "momentum": buy_momentum,
+            "volatility": buy_volatility,
+            "fibonacci": buy_fib,
+            "sr": buy_sr,
+            "bias": buy_bias,
+        },
+        "sell": {
+            "rsi": sell_rsi,
+            "macd": sell_macd,
+            "volume": sell_volume,
+            "momentum": sell_momentum,
+            "volatility": sell_volatility,
+            "fibonacci": sell_fib,
+            "sr": sell_sr,
+            "bias": sell_bias,
+        },
+    }
 
 
 # =========================
@@ -503,233 +606,151 @@ def fib_zone(df: pd.DataFrame, side: str, lookback: int = 50) -> Optional[Tuple[
 class Plan:
     label: str
     symbol: str
-    timeframe: str
-    trend_d1: int
-    trend_h4: int
-    overall: int
     side: str
+    timeframe: str
     entry_type: str
     entry: float
     sl: float
     tp1: float
     tp2: float
     tp3: float
-    zone_name: str
-    zone_low: Optional[float]
-    zone_high: Optional[float]
-    atr_value: float
-    confidence: int
+    confidence: float
     risk_usd: float
-    liq_side: Optional[str]
-    bos_side: Optional[str]
+    buy_score: float
+    sell_score: float
+    support: float
+    resistance: float
     rsi_value: float
-    fib62: Optional[float]
-    fib79: Optional[float]
-    swing_high: Optional[float]
-    swing_low: Optional[float]
-    candle_ok: bool
+    atr_value: float
+    fib_low: Optional[float]
+    fib_high: Optional[float]
+    features_used: Dict[str, float]
+    weighted_contributions: Dict[str, float]
 
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
     r = abs(entry - sl)
     r = max(r, 1e-9)
-
     if side == "BUY":
-        tp1 = entry + (2 * r)
-        tp2 = entry + (3 * r)
-        tp3 = entry + (4 * r)
-    else:
-        tp1 = entry - (2 * r)
-        tp2 = entry - (3 * r)
-        tp3 = entry - (4 * r)
-
-    return tp1, tp2, tp3
+        return entry + (2 * r), entry + (3 * r), entry + (4 * r)
+    return entry - (2 * r), entry - (3 * r), entry - (4 * r)
 
 
-def build_plan(label: str, symbol: str) -> Optional[Plan]:
+def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
     d1 = yf_download_safe(symbol, LOOKBACK_D1, "1d")
     h4 = yf_download_safe(symbol, LOOKBACK_H4, "4h")
     m30 = yf_download_safe(symbol, LOOKBACK_M30, "30m")
     if d1 is None or h4 is None or m30 is None:
         return None
 
-    t_d1 = trend_score(d1)
-    t_h4 = trend_score(h4)
-    overall = t_d1 + t_h4
+    feats = feature_scores(m30, d1, h4, label)
+    meta = feats["meta"]
+    buy_raw = feats["buy"]
+    sell_raw = feats["sell"]
 
-    if overall >= 1:
+    weights = get_symbol_weights(state, label)
+
+    buy_score = 0.0
+    sell_score = 0.0
+    buy_contrib = {}
+    sell_contrib = {}
+
+    for k in DEFAULT_FEATURE_WEIGHTS.keys():
+        w = safe_float(weights.get(k, 1.0), 1.0)
+        bv = safe_float(buy_raw.get(k, 0.0), 0.0)
+        sv = safe_float(sell_raw.get(k, 0.0), 0.0)
+        buy_contrib[k] = bv * w
+        sell_contrib[k] = sv * w
+        buy_score += buy_contrib[k]
+        sell_score += sell_contrib[k]
+
+    # extra bias
+    buy_score += safe_float(buy_raw.get("bias", 0.0))
+    sell_score += safe_float(sell_raw.get("bias", 0.0))
+
+    side = None
+    if buy_score >= MIN_SCORE_TO_SIGNAL and (buy_score - sell_score) >= MIN_SCORE_GAP:
         side = "BUY"
-    elif overall <= -1:
+    elif sell_score >= MIN_SCORE_TO_SIGNAL and (sell_score - buy_score) >= MIN_SCORE_GAP:
         side = "SELL"
     else:
         return None
 
-    px = last_price(m30)
-    a = atr(m30, 14).iloc[-1]
-    if a is None or pd.isna(a) or a <= 0:
+    px = safe_float(meta["last_close"])
+    a = safe_float(meta["atr"])
+    atr_pct = safe_float(meta["atr_pct"])
+    if a <= 0:
         return None
-    a = float(a)
-
-    if (a / (abs(px) + 1e-9)) > MAX_ATR_PCT:
-        return None
-
-    rsi_val = float(rsi(m30["Close"], RSI_PERIOD).iloc[-1])
-    if pd.isna(rsi_val):
+    if atr_pct > MAX_ATR_PCT or atr_pct < MIN_ATR_PCT:
         return None
 
-    if USE_RSI_FILTER:
-        if side == "BUY" and rsi_val > RSI_BUY_MAX:
-            return None
-        if side == "SELL" and rsi_val < RSI_SELL_MIN:
-            return None
+    support = safe_float(meta["support"])
+    resistance = safe_float(meta["resistance"])
 
-    liq_side = detect_liq_sweep_side(m30, a)
-    bos_side = detect_bos_side(m30)
+    fib_low = fib_high = None
+    if side == "BUY" and meta["buy_fib62"] is not None and meta["buy_fib79"] is not None:
+        fib_low = min(meta["buy_fib62"], meta["buy_fib79"])
+        fib_high = max(meta["buy_fib62"], meta["buy_fib79"])
+    elif side == "SELL" and meta["sell_fib62"] is not None and meta["sell_fib79"] is not None:
+        fib_low = min(meta["sell_fib62"], meta["sell_fib79"])
+        fib_high = max(meta["sell_fib62"], meta["sell_fib79"])
 
-    liq_aligned = (liq_side == side)
-    bos_aligned = (bos_side == side)
+    entry_type = "MARKET"
+    entry = px
 
-    if VIP_FILTER_PRO:
-        if not liq_aligned:
-            return None
-        if not bos_aligned:
-            return None
-    elif USE_LIQ_BOS:
-        if liq_side is None and bos_side is None:
-            return None
-        if liq_side is not None and liq_side != side and bos_side is None:
-            return None
-        if bos_side is not None and bos_side != side and liq_side is None:
-            return None
-        if liq_side is not None and bos_side is not None and liq_side != bos_side:
-            return None
-
-    candle_ok = candle_confirmation(m30, side)
-    if USE_CANDLE_CONFIRM and not candle_ok:
-        return None
-
-    ob = find_orderblock(m30, side)
-    fvg = find_fvg(m30, side)
-
-    zone_name = "None"
-    zone = None
-    if ob:
-        zone_name = "OrderBlock"
-        zone = ob
-    elif fvg:
-        zone_name = "FVG"
-        zone = fvg
-
-    if zone is None:
-        return None
-
-    zone_low = float(min(zone[0], zone[1]))
-    zone_high = float(max(zone[0], zone[1]))
-    mid = (zone_low + zone_high) / 2.0
-    dist_atr = abs(px - mid) / (a + 1e-9)
-
-    entry_type = "LIMIT"
-    entry = mid
-
-    fib62 = fib79 = swing_high = swing_low = None
-    if USE_FIB_FILTER:
-        fib_data = fib_zone(m30, side, FIB_LOOKBACK)
-        if fib_data is None:
-            return None
-        fib62, fib79, swing_high, swing_low = fib_data
-
-        fib_min = min(fib62, fib79)
-        fib_max = max(fib62, fib79)
-
-        if not (fib_min <= entry <= fib_max):
-            return None
-
-    strong_trend = abs(overall) == 2
-
-    allow_market = (
-        SMART_ENTRY
-        and bos_aligned
-        and strong_trend
-        and candle_ok
-        and (dist_atr <= MARKET_ATR_MAX)
-    )
-
-    if LIQ_FAVOR_LIMIT and liq_aligned:
-        allow_market = False
-
-    if VIP_FILTER_PRO and not (bos_aligned and strong_trend and dist_atr <= MARKET_ATR_MAX and candle_ok):
-        allow_market = False
-
-    if MODE == "vip_retest":
-        if dist_atr > RETEST_ATR:
-            return None
-        if allow_market:
-            entry_type = "MARKET"
-            entry = px
-        else:
-            entry_type = "LIMIT"
-            entry = mid
+    # smarter entry from confluence
+    if fib_low is not None and fib_high is not None:
+        entry_type = "LIMIT"
+        entry = (fib_low + fib_high) / 2.0
     else:
-        if allow_market:
-            entry_type = "MARKET"
-            entry = px
-        elif dist_atr <= MAX_PENDING_DISTANCE_ATR:
+        if side == "BUY" and support > 0:
             entry_type = "LIMIT"
-            entry = mid
-        else:
-            return None
+            entry = (px + support) / 2.0
+        elif side == "SELL" and resistance > 0:
+            entry_type = "LIMIT"
+            entry = (px + resistance) / 2.0
 
     if side == "BUY":
-        sl = zone_low - (SL_BUFFER_ATR * a)
+        base_sl = min(support, entry - 1.5 * a) if support > 0 else (entry - 1.5 * a)
+        sl = min(base_sl, entry - 0.8 * a)
     else:
-        sl = zone_high + (SL_BUFFER_ATR * a)
+        base_sl = max(resistance, entry + 1.5 * a) if resistance > 0 else (entry + 1.5 * a)
+        sl = max(base_sl, entry + 0.8 * a)
 
-    min_r = 0.25 * a
-    if abs(entry - sl) < min_r:
-        sl = (entry - 1.5 * a) if side == "BUY" else (entry + 1.5 * a)
+    if abs(entry - sl) < 0.25 * a:
+        sl = (entry - 1.2 * a) if side == "BUY" else (entry + 1.2 * a)
 
     tp1, tp2, tp3 = calc_rr_targets(entry, sl, side)
 
-    conf = 4
-    conf += 2 if strong_trend else 1
-    conf += 2 if zone_name in ("OrderBlock", "FVG") else 0
-    conf += 1 if liq_aligned else 0
-    conf += 1 if bos_aligned else 0
-    conf += 1 if USE_RSI_FILTER else 0
-    conf += 1 if USE_FIB_FILTER else 0
-    conf += 1 if candle_ok else 0
-    conf = int(max(1, min(10, conf)))
+    confidence = max(buy_score, sell_score)
+    confidence = clamp(confidence, 1.0, 10.0)
 
-    risk_usd = ACCOUNT_BALANCE * (RISK_PCT / 100.0)
+    features_used = buy_raw if side == "BUY" else sell_raw
+    weighted_contributions = buy_contrib if side == "BUY" else sell_contrib
 
     return Plan(
         label=label,
         symbol=symbol,
-        timeframe="M30",
-        trend_d1=t_d1,
-        trend_h4=t_h4,
-        overall=overall,
         side=side,
+        timeframe="M30",
         entry_type=entry_type,
         entry=float(entry),
         sl=float(sl),
         tp1=float(tp1),
         tp2=float(tp2),
         tp3=float(tp3),
-        zone_name=zone_name,
-        zone_low=zone_low,
-        zone_high=zone_high,
+        confidence=float(confidence),
+        risk_usd=float(ACCOUNT_BALANCE * (RISK_PCT / 100.0)),
+        buy_score=float(buy_score),
+        sell_score=float(sell_score),
+        support=float(support),
+        resistance=float(resistance),
+        rsi_value=float(meta["rsi"]),
         atr_value=float(a),
-        confidence=conf,
-        risk_usd=float(risk_usd),
-        liq_side=liq_side,
-        bos_side=bos_side,
-        rsi_value=float(rsi_val),
-        fib62=fib62,
-        fib79=fib79,
-        swing_high=swing_high,
-        swing_low=swing_low,
-        candle_ok=bool(candle_ok),
+        fib_low=float(fib_low) if fib_low is not None else None,
+        fib_high=float(fib_high) if fib_high is not None else None,
+        features_used={k: float(v) for k, v in features_used.items() if k in DEFAULT_FEATURE_WEIGHTS},
+        weighted_contributions={k: float(v) for k, v in weighted_contributions.items()},
     )
 
 
@@ -760,22 +781,18 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     ax.plot(x, d["EMA_FAST"].values, linewidth=1.2, label=f"EMA{EMA_FAST}")
     ax.plot(x, d["EMA_SLOW"].values, linewidth=1.2, label=f"EMA{EMA_SLOW}")
 
-    if plan.zone_low is not None and plan.zone_high is not None:
-        ax.axhspan(plan.zone_low, plan.zone_high, alpha=0.15)
+    if plan.fib_low is not None and plan.fib_high is not None:
+        ax.axhspan(plan.fib_low, plan.fib_high, alpha=0.08)
 
-    if plan.fib62 is not None and plan.fib79 is not None:
-        fib_min = min(plan.fib62, plan.fib79)
-        fib_max = max(plan.fib62, plan.fib79)
-        ax.axhspan(fib_min, fib_max, alpha=0.08)
-
+    ax.axhline(plan.support, linewidth=1.0, linestyle="--")
+    ax.axhline(plan.resistance, linewidth=1.0, linestyle="--")
     ax.axhline(plan.entry, linewidth=1.2, linestyle="--")
     ax.axhline(plan.sl, linewidth=1.2, linestyle="--")
     ax.axhline(plan.tp1, linewidth=1.0, linestyle=":")
     ax.axhline(plan.tp2, linewidth=1.0, linestyle=":")
     ax.axhline(plan.tp3, linewidth=1.0, linestyle=":")
 
-    title_side = "BUY" if plan.side == "BUY" else "SELL"
-    ax.set_title(f"{plan.label} ({plan.symbol}) | {plan.timeframe} | {title_side} {plan.entry_type}")
+    ax.set_title(f"{plan.label} ({plan.symbol}) | {plan.timeframe} | {plan.side} {plan.entry_type}")
     ax.grid(True, alpha=0.2)
     ax.legend(loc="upper left", fontsize=9)
 
@@ -785,36 +802,29 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     ax.set_xticks(ticks)
     ax.set_xticklabels([str(idx[i])[:16] for i in ticks], rotation=15, ha="right", fontsize=8)
 
-    zone_txt = "None"
-    if plan.zone_low is not None and plan.zone_high is not None:
-        zone_txt = f"{plan.zone_name} [{fmt_price(plan.label, plan.zone_low, plan.entry)} - {fmt_price(plan.label, plan.zone_high, plan.entry)}]"
-
     fib_txt = "OFF"
-    if plan.fib62 is not None and plan.fib79 is not None:
-        fib_txt = f"{fmt_price(plan.label, min(plan.fib62, plan.fib79), plan.entry)} - {fmt_price(plan.label, max(plan.fib62, plan.fib79), plan.entry)}"
+    if plan.fib_low is not None and plan.fib_high is not None:
+        fib_txt = f"{fmt_price(plan.label, plan.fib_low, plan.entry)} - {fmt_price(plan.label, plan.fib_high, plan.entry)}"
 
-    liq_txt = plan.liq_side if plan.liq_side else "NO"
-    bos_txt = plan.bos_side if plan.bos_side else "NO"
-    candle_txt = "YES" if plan.candle_ok else "NO"
+    top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:4]
+    feat_txt = " | ".join([f"{k}:{v:+.2f}" for k, v in top_feats])
 
     analysis_text = (
-        f"Analysis\n"
-        f"D1/H4: {plan.trend_d1:+d}/{plan.trend_h4:+d} | Overall: {plan.overall:+d}\n"
-        f"Liq: {liq_txt} | BOS: {bos_txt}\n"
-        f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
-        f"Fib zone: {fib_txt}\n"
-        f"Candle confirm: {candle_txt}\n"
-        f"Zone: {zone_txt}\n"
+        f"Adaptive Quant\n"
+        f"BUY:{plan.buy_score:.2f} | SELL:{plan.sell_score:.2f}\n"
+        f"RSI: {plan.rsi_value:.1f}\n"
+        f"Support: {fmt_price(plan.label, plan.support, plan.entry)}\n"
+        f"Resistance: {fmt_price(plan.label, plan.resistance, plan.entry)}\n"
+        f"Fib: {fib_txt}\n"
         f"Entry: {fmt_price(plan.label, plan.entry, plan.entry)}\n"
         f"SL: {fmt_price(plan.label, plan.sl, plan.entry)}\n"
-        f"TP1: {fmt_price(plan.label, plan.tp1, plan.entry)}\n"
-        f"Conf: {plan.confidence}/10"
+        f"Top: {feat_txt}"
     )
 
     ax.text(
         0.01, 0.98, analysis_text,
         transform=ax.transAxes,
-        fontsize=9,
+        fontsize=8.5,
         verticalalignment="top",
         bbox=dict(boxstyle="round", alpha=0.15)
     )
@@ -828,12 +838,8 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
 
 
 # =========================
-# DAILY REPORT
+# DAILY / TRADE MGMT
 # =========================
-def _hit_in_bar(high_: float, low_: float, level: float) -> bool:
-    return low_ <= level <= high_
-
-
 def register_trade_for_daily(state: dict, plan: Plan) -> str:
     tid = hashlib.sha1(
         f"{plan.symbol}|{plan.side}|{plan.entry}|{time.time()}".encode("utf-8")
@@ -858,7 +864,7 @@ def register_trade_for_daily(state: dict, plan: Plan) -> str:
         "tp2_done": False,
         "tp3_done": False,
         "be_moved": False,
-        "last_event": "",
+        "features_used": dict(plan.features_used),
     }
 
     day = _utc_date_str(now)
@@ -874,7 +880,7 @@ def register_trade_for_daily(state: dict, plan: Plan) -> str:
         "open": 0,
     })
     daily["signals"] += 1
-    daily["avg_conf_sum"] += int(plan.confidence)
+    daily["avg_conf_sum"] += float(plan.confidence)
     daily["avg_conf_n"] += 1
     daily["open"] += 1
     return tid
@@ -892,6 +898,7 @@ def update_trade_outcomes(state: dict) -> None:
         symbol = tr.get("symbol")
         label = tr.get("label", symbol)
         side = tr.get("side", "BUY")
+        features_used = tr.get("features_used", {})
 
         df = yf_download_safe(symbol, "5d", "30m")
         if df is None or df.empty:
@@ -917,7 +924,6 @@ def update_trade_outcomes(state: dict) -> None:
 
         tp1_done = bool(tr.get("tp1_done", False))
         tp2_done = bool(tr.get("tp2_done", False))
-        tp3_done = bool(tr.get("tp3_done", False))
         be_moved = bool(tr.get("be_moved", False))
 
         for _, row in df2.iterrows():
@@ -925,229 +931,129 @@ def update_trade_outcomes(state: dict) -> None:
             lo = float(row["Low"])
 
             if side == "BUY":
-                if (not tp1_done) and (hi >= tp1):
+                if (not tp1_done) and hi >= tp1:
                     tr["tp1_done"] = True
                     tp1_done = True
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["tp1"] += 1
-
-                    tg_send_message(
-                        CHAT_ID,
-                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}"
-                    )
+                    tg_send_message(CHAT_ID, f"🎯 TP1 HIT\n{label}\nTP1: {tp1}")
 
                     if not be_moved:
                         tr["sl"] = entry
-                        tr["be_moved"] = True
                         sl = entry
+                        tr["be_moved"] = True
                         be_moved = True
-                        tg_send_message(
-                            CHAT_ID,
-                            f"🛡 BreakEven Activated\n{label}\nSL moved to Entry: {entry}"
-                        )
+                        tg_send_message(CHAT_ID, f"🛡 BreakEven Activated\n{label}\nSL moved to Entry: {entry}")
 
-                if tp1_done and (not tp2_done) and (hi >= tp2):
+                if tp1_done and (not tp2_done) and hi >= tp2:
                     tr["tp2_done"] = True
                     tp2_done = True
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["tp2"] += 1
+                    tg_send_message(CHAT_ID, f"🚀 TP2 HIT\n{label}\nTP2: {tp2}")
 
-                    tg_send_message(
-                        CHAT_ID,
-                        f"🚀 TP2 HIT\n{label}\nTP2: {tp2}"
-                    )
-
-                if tp2_done and (not tp3_done) and (hi >= tp3):
+                if tp2_done and hi >= tp3:
                     tr["tp3_done"] = True
                     tr["status"] = "CLOSED"
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["tp3"] += 1
                     daily["wins"] += 1
                     daily["open"] = max(0, int(daily["open"]) - 1)
-
-                    tg_send_message(
-                        CHAT_ID,
-                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}"
-                    )
+                    update_weights_after_trade(state, label, features_used, "WIN")
+                    tg_send_message(CHAT_ID, f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}")
                     break
 
                 if lo <= sl:
                     tr["status"] = "CLOSED"
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["open"] = max(0, int(daily["open"]) - 1)
 
                     if be_moved:
-                        tg_send_message(
-                            CHAT_ID,
-                            f"⚖️ BreakEven Exit\n{label}\nExit at Entry: {entry}"
-                        )
+                        update_weights_after_trade(state, label, features_used, "BE")
+                        tg_send_message(CHAT_ID, f"⚖️ BreakEven Exit\n{label}\nExit at Entry: {entry}")
                     else:
                         daily["losses"] += 1
-                        tg_send_message(
-                            CHAT_ID,
-                            f"❌ SL HIT\n{label}\nSL: {sl}"
-                        )
+                        update_weights_after_trade(state, label, features_used, "LOSS")
+                        tg_send_message(CHAT_ID, f"❌ SL HIT\n{label}\nSL: {sl}")
                     break
 
             else:
-                if (not tp1_done) and (lo <= tp1):
+                if (not tp1_done) and lo <= tp1:
                     tr["tp1_done"] = True
                     tp1_done = True
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["tp1"] += 1
-
-                    tg_send_message(
-                        CHAT_ID,
-                        f"🎯 TP1 HIT\n{label}\nEntry: {entry}\nTP1: {tp1}"
-                    )
+                    tg_send_message(CHAT_ID, f"🎯 TP1 HIT\n{label}\nTP1: {tp1}")
 
                     if not be_moved:
                         tr["sl"] = entry
-                        tr["be_moved"] = True
                         sl = entry
+                        tr["be_moved"] = True
                         be_moved = True
-                        tg_send_message(
-                            CHAT_ID,
-                            f"🛡 BreakEven Activated\n{label}\nSL moved to Entry: {entry}"
-                        )
+                        tg_send_message(CHAT_ID, f"🛡 BreakEven Activated\n{label}\nSL moved to Entry: {entry}")
 
-                if tp1_done and (not tp2_done) and (lo <= tp2):
+                if tp1_done and (not tp2_done) and lo <= tp2:
                     tr["tp2_done"] = True
                     tp2_done = True
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["tp2"] += 1
+                    tg_send_message(CHAT_ID, f"🚀 TP2 HIT\n{label}\nTP2: {tp2}")
 
-                    tg_send_message(
-                        CHAT_ID,
-                        f"🚀 TP2 HIT\n{label}\nTP2: {tp2}"
-                    )
-
-                if tp2_done and (not tp3_done) and (lo <= tp3):
+                if tp2_done and lo <= tp3:
                     tr["tp3_done"] = True
                     tr["status"] = "CLOSED"
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["tp3"] += 1
                     daily["wins"] += 1
                     daily["open"] = max(0, int(daily["open"]) - 1)
-
-                    tg_send_message(
-                        CHAT_ID,
-                        f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}"
-                    )
+                    update_weights_after_trade(state, label, features_used, "WIN")
+                    tg_send_message(CHAT_ID, f"🏁 TP3 HIT - TRADE CLOSED\n{label}\nTP3: {tp3}")
                     break
 
                 if hi >= sl:
                     tr["status"] = "CLOSED"
-
                     day = tr.get("date") or _utc_date_str(ts)
                     daily = state.setdefault("daily", {}).setdefault(day, {
-                        "signals": 0,
-                        "avg_conf_sum": 0,
-                        "avg_conf_n": 0,
-                        "wins": 0,
-                        "losses": 0,
-                        "tp1": 0,
-                        "tp2": 0,
-                        "tp3": 0,
-                        "open": 0,
+                        "signals": 0, "avg_conf_sum": 0, "avg_conf_n": 0,
+                        "wins": 0, "losses": 0, "tp1": 0, "tp2": 0, "tp3": 0, "open": 0,
                     })
                     daily["open"] = max(0, int(daily["open"]) - 1)
 
                     if be_moved:
-                        tg_send_message(
-                            CHAT_ID,
-                            f"⚖️ BreakEven Exit\n{label}\nExit at Entry: {entry}"
-                        )
+                        update_weights_after_trade(state, label, features_used, "BE")
+                        tg_send_message(CHAT_ID, f"⚖️ BreakEven Exit\n{label}\nExit at Entry: {entry}")
                     else:
                         daily["losses"] += 1
-                        tg_send_message(
-                            CHAT_ID,
-                            f"❌ SL HIT\n{label}\nSL: {sl}"
-                        )
+                        update_weights_after_trade(state, label, features_used, "LOSS")
+                        tg_send_message(CHAT_ID, f"❌ SL HIT\n{label}\nSL: {sl}")
                     break
 
 
@@ -1172,8 +1078,7 @@ def format_daily_report(state: dict, day: Optional[str] = None) -> str:
         f"— صفقات مُغلقة: {closed}\n"
         f"✅ Wins: {wins} | ❌ Losses: {losses} | WinRate: {winrate:.1f}%\n"
         f"🎯 TP1: {int(d.get('tp1', 0))} | TP2: {int(d.get('tp2', 0))} | TP3: {int(d.get('tp3', 0))}\n"
-        f"⏳ Open: {open_}\n\n"
-        f"ملاحظة: التقييم تقريبي اعتماداً على شموع Yahoo M30."
+        f"⏳ Open: {open_}\n"
     )
 
 
@@ -1189,40 +1094,27 @@ def maybe_send_daily_report(state: dict) -> None:
 
 
 # =========================
-# FORMAT + DEDUP
+# FORMAT / DEDUP
 # =========================
 def format_plan(plan: Plan) -> str:
     px_hint = plan.entry
     side_emoji = "🟢" if plan.side == "BUY" else "🔴"
-
-    if plan.entry_type == "LIMIT":
-        order = "Buy Limit" if plan.side == "BUY" else "Sell Limit"
-    else:
-        order = "BUY Market" if plan.side == "BUY" else "SELL Market"
-
-    zone_txt = "—"
-    if plan.zone_low is not None and plan.zone_high is not None:
-        zone_txt = (
-            f"{plan.zone_name} "
-            f"[{fmt_price(plan.label, plan.zone_low, px_hint)} - {fmt_price(plan.label, plan.zone_high, px_hint)}]"
-        )
+    order = "Buy Limit" if plan.side == "BUY" and plan.entry_type == "LIMIT" else \
+            "Sell Limit" if plan.side == "SELL" and plan.entry_type == "LIMIT" else \
+            "BUY Market" if plan.side == "BUY" else "SELL Market"
 
     fib_txt = "OFF"
-    if plan.fib62 is not None and plan.fib79 is not None:
-        fib_txt = (
-            f"{fmt_price(plan.label, min(plan.fib62, plan.fib79), px_hint)} - "
-            f"{fmt_price(plan.label, max(plan.fib62, plan.fib79), px_hint)}"
-        )
+    if plan.fib_low is not None and plan.fib_high is not None:
+        fib_txt = f"{fmt_price(plan.label, plan.fib_low, px_hint)} - {fmt_price(plan.label, plan.fib_high, px_hint)}"
 
-    liq_txt = plan.liq_side if plan.liq_side is not None else "❌"
-    bos_txt = plan.bos_side if plan.bos_side is not None else "❌"
-    candle_txt = "✅" if plan.candle_ok else "❌"
+    top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:4]
+    top_txt = " | ".join([f"{k}:{v:+.2f}" for k, v in top_feats])
 
     return (
-        f"🔥 VIP M30\n"
+        f"🔥 VIP AI SIGNAL\n"
         f"📌 {plan.label} ({plan.symbol})\n"
-        f"Trend D1/H4: {plan.trend_d1:+d} / {plan.trend_h4:+d} => Overall: {plan.overall:+d}\n"
-        f"Liq Sweep: {liq_txt} | BOS: {bos_txt} | Candle: {candle_txt}\n"
+        f"BUY SCORE: {plan.buy_score:.2f}\n"
+        f"SELL SCORE: {plan.sell_score:.2f}\n"
         f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
         f"Fib Zone: {fib_txt}\n\n"
         f"{side_emoji} {order}: {fmt_price(plan.label, plan.entry, px_hint)}\n"
@@ -1230,18 +1122,19 @@ def format_plan(plan: Plan) -> str:
         f"TP1: {fmt_price(plan.label, plan.tp1, px_hint)}\n"
         f"TP2: {fmt_price(plan.label, plan.tp2, px_hint)}\n"
         f"TP3: {fmt_price(plan.label, plan.tp3, px_hint)}\n\n"
-        f"Zone: {zone_txt}\n"
+        f"Support: {fmt_price(plan.label, plan.support, px_hint)}\n"
+        f"Resistance: {fmt_price(plan.label, plan.resistance, px_hint)}\n"
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
-        f"Confidence: {plan.confidence}/10\n"
-        f"Mode: {MODE} | VIP_FILTER_PRO={int(VIP_FILTER_PRO)} | RSI={int(USE_RSI_FILTER)} | FIB={int(USE_FIB_FILTER)}\n"
+        f"Confidence: {plan.confidence:.1f}/10\n"
+        f"Top Factors: {top_txt}\n"
+        f"Model: Adaptive Quant v1\n"
     )
 
 
 def signal_hash(plan: Plan) -> str:
     key = (
         f"{plan.symbol}|{plan.side}|{plan.entry_type}|{plan.entry}|{plan.sl}|"
-        f"{plan.tp1}|{plan.tp2}|{plan.tp3}|{plan.zone_name}|{plan.zone_low}|{plan.zone_high}|"
-        f"liq={plan.liq_side}|bos={plan.bos_side}|rsi={plan.rsi_value:.2f}|fib62={plan.fib62}|fib79={plan.fib79}|candle={plan.candle_ok}"
+        f"{plan.tp1}|{plan.tp2}|{plan.tp3}|buy={plan.buy_score:.3f}|sell={plan.sell_score:.3f}"
     )
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
@@ -1272,11 +1165,10 @@ def mark_sent(state: dict, plan: Plan) -> None:
 # COMMANDS
 # =========================
 HELP_TEXT = (
-    "✅ أوامر VIP:\n"
+    "✅ أوامر البوت:\n"
     "/help\n"
     "/status\n"
     "/symbols\n"
-    "/mode vip_retest أو /mode vip_mix\n"
     "/analyze XAU\n"
     "/scan\n"
     "/daily\n"
@@ -1319,8 +1211,6 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         parts = ["/analyze", ALIASES[cmd]]
         cmd = "/analyze"
 
-    global MODE
-
     if cmd in ("/help", "/halp"):
         tg_send_message(chat_id, HELP_TEXT)
         return
@@ -1328,26 +1218,14 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
     if cmd == "/status":
         tg_send_message(
             chat_id,
-            f"MODE={MODE}\n"
             f"CHECK_INTERVAL_SEC={CHECK_INTERVAL_SEC}\n"
             f"COOLDOWN_MINUTES={COOLDOWN_MINUTES}\n"
-            f"RETEST_ATR={RETEST_ATR}\n"
-            f"MAX_PENDING_DISTANCE_ATR={MAX_PENDING_DISTANCE_ATR}\n"
-            f"MARKET_ATR_MAX={MARKET_ATR_MAX}\n"
-            f"SL_BUFFER_ATR={SL_BUFFER_ATR}\n"
-            f"MAX_ATR_PCT={MAX_ATR_PCT}\n"
-            f"SMART_ENTRY={int(SMART_ENTRY)}\n"
-            f"VIP_FILTER_PRO={int(VIP_FILTER_PRO)}\n"
-            f"USE_RSI_FILTER={int(USE_RSI_FILTER)} | RSI_BUY_MAX={RSI_BUY_MAX} | RSI_SELL_MIN={RSI_SELL_MIN}\n"
-            f"USE_FIB_FILTER={int(USE_FIB_FILTER)} | FIB_LOOKBACK={FIB_LOOKBACK}\n"
-            f"USE_CANDLE_CONFIRM={int(USE_CANDLE_CONFIRM)}\n"
+            f"MIN_SCORE_TO_SIGNAL={MIN_SCORE_TO_SIGNAL}\n"
+            f"MIN_SCORE_GAP={MIN_SCORE_GAP}\n"
+            f"RSI_PERIOD={RSI_PERIOD}\n"
+            f"FIB_LOOKBACK={FIB_LOOKBACK}\n"
             f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
-            f"SESSION_UTC={SESSION_START_UTC:02d}:00 -> {SESSION_END_UTC:02d}:00\n"
-            f"ASIA_ALLOWED=XAU,XAG,US100,US30,GER40,OILCASH\n"
-            f"WEEKEND_FILTER=1\n"
-            f"USE_LIQ_BOS={int(USE_LIQ_BOS)}\n"
-            f"MIN_CONF_SCAN={MIN_CONF_SCAN}\n"
-            f"RISK_PCT={RISK_PCT}\n"
+            f"USE_LEARNING=1\n"
             f"PAUSED={state.get('paused', False)}"
         )
         return
@@ -1357,19 +1235,10 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         tg_send_message(chat_id, "Symbols: " + ", ".join([f"{k}={v}" for k, v in items]))
         return
 
-    if cmd == "/mode" and len(parts) >= 2:
-        m = parts[1].strip().lower()
-        if m in ("vip_retest", "vip_mix"):
-            MODE = m
-            tg_send_message(chat_id, f"✅ MODE set to {MODE}")
-        else:
-            tg_send_message(chat_id, "❌ mode يجب أن يكون vip_retest أو vip_mix")
-        return
-
     if cmd == "/pause":
         state["paused"] = True
         save_state(state)
-        tg_send_message(chat_id, "⏸️ تم إيقاف الإشارات التلقائية مؤقتاً.")
+        tg_send_message(chat_id, "⏸️ تم إيقاف الإشارات التلقائية.")
         return
 
     if cmd == "/resume":
@@ -1395,12 +1264,12 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             return
 
         if not session_allowed_for_symbol(sym_key):
-            tg_send_message(chat_id, f"⏰ {sym_key} خارج جلسة التداول المسموح بها الآن.")
+            tg_send_message(chat_id, f"⏰ {sym_key} خارج الجلسة المسموح بها.")
             return
 
-        plan = build_plan(sym_key, SYMBOLS[sym_key])
+        plan = build_plan(state, sym_key, SYMBOLS[sym_key])
         if plan is None:
-            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key} حسب شروط VIP.")
+            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key}.")
             return
 
         m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
@@ -1408,13 +1277,11 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             tg_send_message(chat_id, "⚠️ تعذر جلب بيانات الشارت.")
             return
 
-        caption = format_plan(plan)
-        tg_send_message(chat_id, caption)
-
+        tg_send_message(chat_id, format_plan(plan))
         try:
             img = render_chart(m30, plan)
-            photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
-            if not photo_ok:
+            ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+            if not ok:
                 tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
         except Exception as e:
             tg_send_message(chat_id, f"⚠️ Chart error for {plan.label}: {e}")
@@ -1424,24 +1291,18 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
         return
 
     if cmd == "/scan":
-        plans: List[Tuple[int, Plan]] = []
-
+        plans: List[Tuple[float, Plan]] = []
         for k, sym in SYMBOLS.items():
             if not market_is_open_for_symbol(k):
                 continue
             if not session_allowed_for_symbol(k):
                 continue
-
-            p = build_plan(k, sym)
+            p = build_plan(state, k, sym)
             if p is None:
                 continue
             if p.confidence < MIN_CONF_SCAN:
                 continue
-
-            score = p.confidence
-            score += 1 if p.liq_side == p.side else 0
-            score += 1 if p.bos_side == p.side else 0
-            plans.append((score, p))
+            plans.append((p.confidence, p))
 
         if not plans:
             tg_send_message(chat_id, "⚠️ لا توجد إشارات قوية حالياً.")
@@ -1455,13 +1316,11 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             if m30 is None or m30.empty:
                 continue
 
-            caption = f"🔥 TOP VIP SIGNAL #{i}\n\n" + format_plan(plan)
-            tg_send_message(chat_id, caption)
-
+            tg_send_message(chat_id, f"🔥 TOP AI SIGNAL #{i}\n\n" + format_plan(plan))
             try:
                 img = render_chart(m30, plan)
-                photo_ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
-                if not photo_ok:
+                ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+                if not ok:
                     tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
             except Exception as e:
                 tg_send_message(chat_id, f"⚠️ Chart error for {plan.label}: {e}")
@@ -1488,14 +1347,11 @@ def main():
         logger.info("Bot username: @%s", bot_username)
 
     state = load_state()
-    logger.info(
-        "VIP bot started. MODE=%s | VIP_FILTER_PRO=%s | RSI=%s | FIB=%s | CANDLE=%s | CHAT_ID=%s",
-        MODE, int(VIP_FILTER_PRO), int(USE_RSI_FILTER), int(USE_FIB_FILTER), int(USE_CANDLE_CONFIRM), CHAT_ID
-    )
+    logger.info("Adaptive Quant bot started | CHAT_ID=%s", CHAT_ID)
 
     tg_send_message(
         CHAT_ID,
-        "✅ VIP PRO Bot Online (SMC + Sweep + BOS + OB/FVG + RSI + Fibonacci + Candle Confirm + BE). اكتب /help"
+        "✅ Adaptive Quant Bot Online (RSI + MACD + Volume + Momentum + ATR + Fib + S/R + Learning). اكتب /help"
     )
 
     last_check = 0.0
@@ -1529,7 +1385,7 @@ def main():
                 if not session_allowed_for_symbol(label):
                     continue
 
-                plan = build_plan(label, sym)
+                plan = build_plan(state, label, sym)
                 if plan is None:
                     continue
                 if not should_send(state, plan):
@@ -1539,13 +1395,11 @@ def main():
                 if m30 is None or m30.empty:
                     continue
 
-                caption = format_plan(plan)
-                tg_send_message(CHAT_ID, caption)
-
+                tg_send_message(CHAT_ID, format_plan(plan))
                 try:
                     img = render_chart(m30, plan)
-                    photo_ok = tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
-                    if not photo_ok:
+                    ok = tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
+                    if not ok:
                         tg_send_message(CHAT_ID, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
                 except Exception as e:
                     tg_send_message(CHAT_ID, f"⚠️ Chart error for {plan.label}: {e}")
