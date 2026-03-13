@@ -37,8 +37,8 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "45"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "25"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 UPDATES_TIMEOUT = 30
@@ -687,7 +687,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     wy = detect_wyckoff(m30, lookback=WYCKOFF_LOOKBACK)
     st = analyze_structure(m30)
 
-    # RSI
     buy_rsi = 0.0
     sell_rsi = 0.0
     if last_rsi <= 30:
@@ -699,7 +698,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     elif last_rsi >= 65:
         sell_rsi = 1.2
 
-    # MACD
     buy_macd = 0.0
     sell_macd = 0.0
     if prev_macd <= prev_signal and last_macd > last_signal:
@@ -712,7 +710,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         elif last_hist < 0:
             sell_macd = 0.7
 
-    # Volume
     buy_volume = 0.0
     sell_volume = 0.0
     if vol_ratio >= 1.4:
@@ -721,7 +718,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         elif momentum_val < 0:
             sell_volume = 1.2
 
-    # Momentum
     buy_momentum = 0.0
     sell_momentum = 0.0
     if momentum_val > 0:
@@ -729,7 +725,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     elif momentum_val < 0:
         sell_momentum = 1.1
 
-    # Volatility
     buy_volatility = 0.0
     sell_volatility = 0.0
     if MIN_ATR_PCT <= atr_pct <= MAX_ATR_PCT:
@@ -739,7 +734,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         buy_volatility = -0.8
         sell_volatility = -0.8
 
-    # Fibonacci
     buy_fib = 0.0
     sell_fib = 0.0
     buy_fib62 = buy_fib79 = None
@@ -762,7 +756,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         if lo <= last_close <= hi:
             sell_fib = 1.8
 
-    # Support / Resistance
     buy_sr = 0.0
     sell_sr = 0.0
     if dist_to_support <= 1.0:
@@ -770,7 +763,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     if dist_to_resistance <= 1.0:
         sell_sr = 1.5
 
-    # Higher TF bias
     buy_bias = 0.0
     sell_bias = 0.0
     if trend_bias >= 2:
@@ -782,7 +774,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     elif trend_bias == -1:
         sell_bias = 0.6
 
-    # Trend strength filter
     buy_trend = 0.0
     sell_trend = 0.0
     if st.trend == "bullish":
@@ -798,7 +789,6 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
             buy_macd -= 0.8
             buy_sr -= 0.5
 
-    # SMC Layers
     buy_liquidity = 1.7 if st.sweep_buy else 0.0
     sell_liquidity = 1.7 if st.sweep_sell else 0.0
 
@@ -979,14 +969,27 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
     support = safe_float(meta["support"])
     resistance = safe_float(meta["resistance"])
 
-    # Hard anti-countertrend guard
     smc_trend = str(meta.get("smc_trend", "neutral"))
     smc_strength = float(meta.get("smc_strength", 0.0))
+
     if side == "SELL" and smc_trend == "bullish" and smc_strength >= 8.0:
-        if not (bool(meta.get("smc_sweep_sell", False)) and (bool(meta.get("smc_bos_sell", False)) or bool(meta.get("smc_choch_sell", False)))):
+        if not (
+            bool(meta.get("smc_sweep_sell", False))
+            and (
+                bool(meta.get("smc_bos_sell", False))
+                or bool(meta.get("smc_choch_sell", False))
+            )
+        ):
             return None
+
     if side == "BUY" and smc_trend == "bearish" and smc_strength >= 8.0:
-        if not (bool(meta.get("smc_sweep_buy", False)) and (bool(meta.get("smc_bos_buy", False)) or bool(meta.get("smc_choch_buy", False)))):
+        if not (
+            bool(meta.get("smc_sweep_buy", False))
+            and (
+                bool(meta.get("smc_bos_buy", False))
+                or bool(meta.get("smc_choch_buy", False))
+            )
+        ):
             return None
 
     fib_low = fib_high = None
@@ -1000,16 +1003,50 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
     entry_type = "MARKET"
     entry = px
 
-    if fib_low is not None and fib_high is not None:
-        entry_type = "LIMIT"
-        entry = (fib_low + fib_high) / 2.0
-    else:
+    zone_low = fib_low
+    zone_high = fib_high
+
+    if zone_low is None or zone_high is None:
         if side == "BUY" and support > 0:
-            entry_type = "LIMIT"
-            entry = (px + support) / 2.0
+            zone_low = support - (0.20 * a)
+            zone_high = support + (0.20 * a)
         elif side == "SELL" and resistance > 0:
-            entry_type = "LIMIT"
-            entry = (px + resistance) / 2.0
+            zone_low = resistance - (0.20 * a)
+            zone_high = resistance + (0.20 * a)
+
+    if zone_low is None or zone_high is None:
+        return None
+
+    zone_low = float(min(zone_low, zone_high))
+    zone_high = float(max(zone_low, zone_high))
+    zone_mid = (zone_low + zone_high) / 2.0
+
+    if side == "SELL":
+        if zone_low <= px <= zone_high:
+            entry_type = "MARKET"
+            entry = px
+        elif px > zone_high:
+            dist = (px - zone_high) / (a + 1e-9)
+            if dist <= 1.0:
+                entry_type = "LIMIT"
+                entry = zone_mid
+            else:
+                return None
+        else:
+            return None
+    else:
+        if zone_low <= px <= zone_high:
+            entry_type = "MARKET"
+            entry = px
+        elif px < zone_low:
+            dist = (zone_low - px) / (a + 1e-9)
+            if dist <= 1.0:
+                entry_type = "LIMIT"
+                entry = zone_mid
+            else:
+                return None
+        else:
+            return None
 
     if side == "BUY":
         base_sl = min(support, entry - 1.5 * a) if support > 0 else (entry - 1.5 * a)
@@ -1022,6 +1059,16 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
         sl = (entry - 1.2 * a) if side == "BUY" else (entry + 1.2 * a)
 
     tp1, tp2, tp3 = calc_rr_targets(entry, sl, side)
+
+    if side == "SELL" and px <= tp1:
+        return None
+    if side == "BUY" and px >= tp1:
+        return None
+
+    entry_distance_atr = abs(entry - px) / (a + 1e-9)
+    if entry_type == "LIMIT" and entry_distance_atr > 1.2:
+        return None
+
     confidence = clamp(max(buy_score, sell_score), 1.0, 10.0)
 
     features_used = buy_raw if side == "BUY" else sell_raw
@@ -1129,7 +1176,7 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     if plan.wy_upthrust:
         wy_txt += " | Upthrust"
 
-    top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:4]
+    top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
     feat_txt = " | ".join([f"{k}:{v:+.2f}" for k, v in top_feats])
 
     analysis_text = (
