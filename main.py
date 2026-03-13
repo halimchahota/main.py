@@ -25,7 +25,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("adaptive_quant_bot")
+logger = logging.getLogger("adaptive_quant_wyckoff_bot")
 
 
 # =========================
@@ -67,6 +67,7 @@ SR_LOOKBACK = int(os.getenv("SR_LOOKBACK", "60"))
 FIB_LOOKBACK = int(os.getenv("FIB_LOOKBACK", "50"))
 MOMENTUM_BARS = int(os.getenv("MOMENTUM_BARS", "6"))
 VOLUME_LOOKBACK = int(os.getenv("VOLUME_LOOKBACK", "20"))
+WYCKOFF_LOOKBACK = int(os.getenv("WYCKOFF_LOOKBACK", "50"))
 
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))
 DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))
@@ -176,6 +177,7 @@ DEFAULT_FEATURE_WEIGHTS = {
     "volatility": 0.80,
     "fibonacci": 1.10,
     "sr": 1.10,
+    "wyckoff": 1.30,
 }
 
 
@@ -222,6 +224,7 @@ def get_symbol_weights(state: dict, label: str) -> dict:
     state.setdefault("weights_symbol", {})
     if label not in state["weights_symbol"]:
         state["weights_symbol"][label] = DEFAULT_FEATURE_WEIGHTS.copy()
+
     out = {}
     for k in DEFAULT_FEATURE_WEIGHTS.keys():
         g = safe_float(state["weights_global"].get(k, DEFAULT_FEATURE_WEIGHTS[k]), DEFAULT_FEATURE_WEIGHTS[k])
@@ -415,6 +418,94 @@ def fib_zone(df: pd.DataFrame, side: str, lookback: int = 50) -> Optional[Tuple[
 
 
 # =========================
+# WYCKOFF ENGINE
+# =========================
+@dataclass
+class WyckoffSignal:
+    phase: str
+    spring: bool
+    upthrust: bool
+    buy_score: float
+    sell_score: float
+    range_high: float
+    range_low: float
+    volume_ratio: float
+
+
+def detect_wyckoff(df: pd.DataFrame, lookback: int = 50) -> WyckoffSignal:
+    if df is None or len(df) < lookback + 5:
+        return WyckoffSignal(
+            phase="neutral",
+            spring=False,
+            upthrust=False,
+            buy_score=0.0,
+            sell_score=0.0,
+            range_high=0.0,
+            range_low=0.0,
+            volume_ratio=1.0,
+        )
+
+    d = df.tail(lookback).copy()
+
+    range_high = float(d["High"].iloc[:-1].max())
+    range_low = float(d["Low"].iloc[:-1].min())
+
+    last_open = float(d["Open"].iloc[-1])
+    last_high = float(d["High"].iloc[-1])
+    last_low = float(d["Low"].iloc[-1])
+    last_close = float(d["Close"].iloc[-1])
+
+    vol = d["Volume"].fillna(0)
+    vol_ma = float(vol.iloc[:-1].tail(20).mean()) if len(vol) >= 21 else float(vol.mean())
+    last_vol = float(vol.iloc[-1]) if len(vol) else 0.0
+    volume_ratio = (last_vol / (vol_ma + 1e-9)) if vol_ma > 0 else 1.0
+
+    full_range = max(range_high - range_low, 1e-9)
+    body = abs(last_close - last_open)
+
+    spring = (last_low < range_low) and (last_close > range_low)
+    upthrust = (last_high > range_high) and (last_close < range_high)
+
+    buy_score = 0.0
+    sell_score = 0.0
+    phase = "neutral"
+
+    recent_span = float(d["High"].max() - d["Low"].min())
+    compression = full_range / (recent_span + 1e-9)
+
+    if spring:
+        buy_score += 2.5
+        if volume_ratio >= 1.2:
+            buy_score += 1.2
+        if body > full_range * 0.10:
+            buy_score += 0.8
+        phase = "accumulation"
+
+    if upthrust:
+        sell_score += 2.5
+        if volume_ratio >= 1.2:
+            sell_score += 1.2
+        if body > full_range * 0.10:
+            sell_score += 0.8
+        phase = "distribution"
+
+    if phase == "neutral" and compression > 0.75:
+        buy_score += 0.3
+        sell_score += 0.3
+
+    return WyckoffSignal(
+        phase=phase,
+        spring=bool(spring),
+        upthrust=bool(upthrust),
+        buy_score=float(buy_score),
+        sell_score=float(sell_score),
+        range_high=float(range_high),
+        range_low=float(range_low),
+        volume_ratio=float(volume_ratio),
+    )
+
+
+# =========================
 # SCORING ENGINE
 # =========================
 def trend_bias_from_higher_tf(d1: pd.DataFrame, h4: pd.DataFrame) -> int:
@@ -465,8 +556,9 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     dist_to_resistance = abs(last_close - resistance) / (last_atr + 1e-9)
 
     trend_bias = trend_bias_from_higher_tf(d1, h4)
+    wy = detect_wyckoff(m30, lookback=WYCKOFF_LOOKBACK)
 
-    # RSI score
+    # RSI
     buy_rsi = 0.0
     sell_rsi = 0.0
     if last_rsi <= 30:
@@ -478,7 +570,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     elif last_rsi >= 65:
         sell_rsi = 1.2
 
-    # MACD score
+    # MACD
     buy_macd = 0.0
     sell_macd = 0.0
     if prev_macd <= prev_signal and last_macd > last_signal:
@@ -491,7 +583,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         elif last_hist < 0:
             sell_macd = 0.7
 
-    # Volume score
+    # Volume
     buy_volume = 0.0
     sell_volume = 0.0
     if vol_ratio >= 1.4:
@@ -500,7 +592,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         elif momentum_val < 0:
             sell_volume = 1.2
 
-    # Momentum score
+    # Momentum
     buy_momentum = 0.0
     sell_momentum = 0.0
     if momentum_val > 0:
@@ -508,7 +600,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     elif momentum_val < 0:
         sell_momentum = 1.1
 
-    # Volatility score
+    # Volatility
     buy_volatility = 0.0
     sell_volatility = 0.0
     if MIN_ATR_PCT <= atr_pct <= MAX_ATR_PCT:
@@ -518,7 +610,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         buy_volatility = -0.8
         sell_volatility = -0.8
 
-    # Fibonacci score
+    # Fibonacci
     buy_fib = 0.0
     sell_fib = 0.0
     buy_fib62 = buy_fib79 = buy_high = buy_low = None
@@ -541,7 +633,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
         if lo <= last_close <= hi:
             sell_fib = 1.8
 
-    # Support / Resistance score
+    # Support / Resistance
     buy_sr = 0.0
     sell_sr = 0.0
     if dist_to_support <= 1.0:
@@ -549,7 +641,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     if dist_to_resistance <= 1.0:
         sell_sr = 1.5
 
-    # Higher timeframe bias
+    # Higher TF bias
     buy_bias = 0.0
     sell_bias = 0.0
     if trend_bias >= 2:
@@ -575,6 +667,12 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
             "buy_fib79": buy_fib79,
             "sell_fib62": sell_fib62,
             "sell_fib79": sell_fib79,
+            "wy_phase": wy.phase,
+            "wy_spring": wy.spring,
+            "wy_upthrust": wy.upthrust,
+            "wy_range_high": wy.range_high,
+            "wy_range_low": wy.range_low,
+            "wy_volume_ratio": wy.volume_ratio,
         },
         "buy": {
             "rsi": buy_rsi,
@@ -584,6 +682,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
             "volatility": buy_volatility,
             "fibonacci": buy_fib,
             "sr": buy_sr,
+            "wyckoff": wy.buy_score,
             "bias": buy_bias,
         },
         "sell": {
@@ -594,6 +693,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
             "volatility": sell_volatility,
             "fibonacci": sell_fib,
             "sr": sell_sr,
+            "wyckoff": wy.sell_score,
             "bias": sell_bias,
         },
     }
@@ -626,6 +726,11 @@ class Plan:
     fib_high: Optional[float]
     features_used: Dict[str, float]
     weighted_contributions: Dict[str, float]
+    wy_phase: str
+    wy_spring: bool
+    wy_upthrust: bool
+    wy_range_high: float
+    wy_range_low: float
 
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
@@ -664,7 +769,6 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
         buy_score += buy_contrib[k]
         sell_score += sell_contrib[k]
 
-    # extra bias
     buy_score += safe_float(buy_raw.get("bias", 0.0))
     sell_score += safe_float(sell_raw.get("bias", 0.0))
 
@@ -698,7 +802,6 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
     entry_type = "MARKET"
     entry = px
 
-    # smarter entry from confluence
     if fib_low is not None and fib_high is not None:
         entry_type = "LIMIT"
         entry = (fib_low + fib_high) / 2.0
@@ -751,6 +854,11 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
         fib_high=float(fib_high) if fib_high is not None else None,
         features_used={k: float(v) for k, v in features_used.items() if k in DEFAULT_FEATURE_WEIGHTS},
         weighted_contributions={k: float(v) for k, v in weighted_contributions.items()},
+        wy_phase=str(meta.get("wy_phase", "neutral")),
+        wy_spring=bool(meta.get("wy_spring", False)),
+        wy_upthrust=bool(meta.get("wy_upthrust", False)),
+        wy_range_high=float(meta.get("wy_range_high", 0.0)),
+        wy_range_low=float(meta.get("wy_range_low", 0.0)),
     )
 
 
@@ -784,6 +892,9 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     if plan.fib_low is not None and plan.fib_high is not None:
         ax.axhspan(plan.fib_low, plan.fib_high, alpha=0.08)
 
+    if plan.wy_range_low > 0 and plan.wy_range_high > 0:
+        ax.axhspan(plan.wy_range_low, plan.wy_range_high, alpha=0.05)
+
     ax.axhline(plan.support, linewidth=1.0, linestyle="--")
     ax.axhline(plan.resistance, linewidth=1.0, linestyle="--")
     ax.axhline(plan.entry, linewidth=1.2, linestyle="--")
@@ -806,13 +917,20 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     if plan.fib_low is not None and plan.fib_high is not None:
         fib_txt = f"{fmt_price(plan.label, plan.fib_low, plan.entry)} - {fmt_price(plan.label, plan.fib_high, plan.entry)}"
 
+    wy_txt = plan.wy_phase
+    if plan.wy_spring:
+        wy_txt += " | Spring"
+    if plan.wy_upthrust:
+        wy_txt += " | Upthrust"
+
     top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:4]
     feat_txt = " | ".join([f"{k}:{v:+.2f}" for k, v in top_feats])
 
     analysis_text = (
-        f"Adaptive Quant\n"
+        f"Adaptive Quant + Wyckoff\n"
         f"BUY:{plan.buy_score:.2f} | SELL:{plan.sell_score:.2f}\n"
         f"RSI: {plan.rsi_value:.1f}\n"
+        f"Wyckoff: {wy_txt}\n"
         f"Support: {fmt_price(plan.label, plan.support, plan.entry)}\n"
         f"Resistance: {fmt_price(plan.label, plan.resistance, plan.entry)}\n"
         f"Fib: {fib_txt}\n"
@@ -1099,13 +1217,22 @@ def maybe_send_daily_report(state: dict) -> None:
 def format_plan(plan: Plan) -> str:
     px_hint = plan.entry
     side_emoji = "🟢" if plan.side == "BUY" else "🔴"
-    order = "Buy Limit" if plan.side == "BUY" and plan.entry_type == "LIMIT" else \
-            "Sell Limit" if plan.side == "SELL" and plan.entry_type == "LIMIT" else \
-            "BUY Market" if plan.side == "BUY" else "SELL Market"
+    order = (
+        "Buy Limit" if plan.side == "BUY" and plan.entry_type == "LIMIT"
+        else "Sell Limit" if plan.side == "SELL" and plan.entry_type == "LIMIT"
+        else "BUY Market" if plan.side == "BUY"
+        else "SELL Market"
+    )
 
     fib_txt = "OFF"
     if plan.fib_low is not None and plan.fib_high is not None:
         fib_txt = f"{fmt_price(plan.label, plan.fib_low, px_hint)} - {fmt_price(plan.label, plan.fib_high, px_hint)}"
+
+    wy_txt = plan.wy_phase
+    if plan.wy_spring:
+        wy_txt += " | Spring ✅"
+    if plan.wy_upthrust:
+        wy_txt += " | Upthrust ✅"
 
     top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:4]
     top_txt = " | ".join([f"{k}:{v:+.2f}" for k, v in top_feats])
@@ -1116,6 +1243,7 @@ def format_plan(plan: Plan) -> str:
         f"BUY SCORE: {plan.buy_score:.2f}\n"
         f"SELL SCORE: {plan.sell_score:.2f}\n"
         f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
+        f"Wyckoff: {wy_txt}\n"
         f"Fib Zone: {fib_txt}\n\n"
         f"{side_emoji} {order}: {fmt_price(plan.label, plan.entry, px_hint)}\n"
         f"SL: {fmt_price(plan.label, plan.sl, px_hint)}\n"
@@ -1127,7 +1255,7 @@ def format_plan(plan: Plan) -> str:
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
         f"Confidence: {plan.confidence:.1f}/10\n"
         f"Top Factors: {top_txt}\n"
-        f"Model: Adaptive Quant v1\n"
+        f"Model: Adaptive Quant + Wyckoff\n"
     )
 
 
@@ -1224,6 +1352,7 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             f"MIN_SCORE_GAP={MIN_SCORE_GAP}\n"
             f"RSI_PERIOD={RSI_PERIOD}\n"
             f"FIB_LOOKBACK={FIB_LOOKBACK}\n"
+            f"WYCKOFF_LOOKBACK={WYCKOFF_LOOKBACK}\n"
             f"USE_SESSION_FILTER={int(USE_SESSION_FILTER)}\n"
             f"USE_LEARNING=1\n"
             f"PAUSED={state.get('paused', False)}"
@@ -1347,11 +1476,11 @@ def main():
         logger.info("Bot username: @%s", bot_username)
 
     state = load_state()
-    logger.info("Adaptive Quant bot started | CHAT_ID=%s", CHAT_ID)
+    logger.info("Adaptive Quant + Wyckoff bot started | CHAT_ID=%s", CHAT_ID)
 
     tg_send_message(
         CHAT_ID,
-        "✅ Adaptive Quant Bot Online (RSI + MACD + Volume + Momentum + ATR + Fib + S/R + Learning). اكتب /help"
+        "✅ Adaptive Quant + Wyckoff Bot Online (RSI + MACD + Volume + Momentum + ATR + Fib + S/R + Wyckoff + Learning). اكتب /help"
     )
 
     last_check = 0.0
