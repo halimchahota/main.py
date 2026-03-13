@@ -25,7 +25,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("adaptive_quant_wyckoff_bot")
+logger = logging.getLogger("institutional_adaptive_bot")
 
 
 # =========================
@@ -57,8 +57,8 @@ MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
 
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/state.json")
 
-MIN_SCORE_TO_SIGNAL = float(os.getenv("MIN_SCORE_TO_SIGNAL", "7.2"))
-MIN_SCORE_GAP = float(os.getenv("MIN_SCORE_GAP", "1.4"))
+MIN_SCORE_TO_SIGNAL = float(os.getenv("MIN_SCORE_TO_SIGNAL", "7.8"))
+MIN_SCORE_GAP = float(os.getenv("MIN_SCORE_GAP", "1.8"))
 
 MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "0.010"))
 MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.0005"))
@@ -77,16 +77,14 @@ SESSION_START_UTC = int(os.getenv("SESSION_START_UTC", "7"))
 SESSION_END_UTC = int(os.getenv("SESSION_END_UTC", "21"))
 
 SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "3"))
-MIN_CONF_SCAN = float(os.getenv("MIN_CONF_SCAN", "7.5"))
+MIN_CONF_SCAN = float(os.getenv("MIN_CONF_SCAN", "7.8"))
 
-# adaptive learning
-LEARN_RATE_WIN = float(os.getenv("LEARN_RATE_WIN", "0.08"))
-LEARN_RATE_LOSS = float(os.getenv("LEARN_RATE_LOSS", "0.06"))
+LEARN_RATE_WIN = float(os.getenv("LEARN_RATE_WIN", "0.10"))
+LEARN_RATE_LOSS = float(os.getenv("LEARN_RATE_LOSS", "0.08"))
 LEARN_RATE_BE = float(os.getenv("LEARN_RATE_BE", "0.02"))
 WEIGHT_MIN = float(os.getenv("WEIGHT_MIN", "0.40"))
-WEIGHT_MAX = float(os.getenv("WEIGHT_MAX", "2.20"))
+WEIGHT_MAX = float(os.getenv("WEIGHT_MAX", "2.40"))
 
-# symbols
 SYMBOLS: Dict[str, str] = {
     "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
     "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
@@ -100,7 +98,6 @@ SYMBOLS: Dict[str, str] = {
 }
 
 CRYPTO_LABELS = {"BTC"}
-
 TELEGRAM_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 
@@ -170,14 +167,19 @@ def fmt_price(label: str, x: float, px_hint: float) -> str:
 # STATE
 # =========================
 DEFAULT_FEATURE_WEIGHTS = {
-    "rsi": 1.00,
-    "macd": 1.00,
-    "volume": 0.90,
-    "momentum": 1.00,
-    "volatility": 0.80,
-    "fibonacci": 1.10,
-    "sr": 1.10,
-    "wyckoff": 1.30,
+    "rsi": 0.90,
+    "macd": 0.90,
+    "volume": 0.80,
+    "momentum": 0.90,
+    "volatility": 0.70,
+    "fibonacci": 1.00,
+    "sr": 1.00,
+    "wyckoff": 1.25,
+    "trend": 1.40,
+    "liquidity": 1.35,
+    "bos": 1.30,
+    "choch": 1.20,
+    "displacement": 1.15,
 }
 
 
@@ -254,7 +256,6 @@ def update_weights_after_trade(state: dict, label: str, features_used: dict, out
             continue
 
         delta = lr * strength * direction
-
         g = safe_float(state["weights_global"].get(k, DEFAULT_FEATURE_WEIGHTS[k]), DEFAULT_FEATURE_WEIGHTS[k])
         s = safe_float(state["weights_symbol"][label].get(k, DEFAULT_FEATURE_WEIGHTS[k]), DEFAULT_FEATURE_WEIGHTS[k])
 
@@ -506,6 +507,133 @@ def detect_wyckoff(df: pd.DataFrame, lookback: int = 50) -> WyckoffSignal:
 
 
 # =========================
+# SMART MONEY / PRICE ACTION
+# =========================
+@dataclass
+class StructureSignal:
+    trend: str
+    bos_buy: bool
+    bos_sell: bool
+    choch_buy: bool
+    choch_sell: bool
+    sweep_buy: bool
+    sweep_sell: bool
+    displacement_buy: bool
+    displacement_sell: bool
+    strength: float
+
+
+def detect_trend_strength(df: pd.DataFrame, ema_fast: int = 20, ema_slow: int = 50) -> Tuple[str, float]:
+    if df is None or len(df) < max(ema_fast, ema_slow) + 10:
+        return "neutral", 0.0
+
+    c = df["Close"]
+    f = ema(c, ema_fast)
+    s = ema(c, ema_slow)
+
+    last_close = float(c.iloc[-1])
+    last_f = float(f.iloc[-1])
+    last_s = float(s.iloc[-1])
+
+    slope_f = (float(f.iloc[-1]) - float(f.iloc[-5])) / (abs(float(f.iloc[-5])) + 1e-9)
+    slope_s = (float(s.iloc[-1]) - float(s.iloc[-5])) / (abs(float(s.iloc[-5])) + 1e-9)
+
+    if last_close > last_f > last_s and slope_f > 0 and slope_s > 0:
+        return "bullish", 8.5
+    if last_close < last_f < last_s and slope_f < 0 and slope_s < 0:
+        return "bearish", 8.5
+    if last_close > last_s:
+        return "bullish", 5.5
+    if last_close < last_s:
+        return "bearish", 5.5
+    return "neutral", 3.0
+
+
+def detect_liquidity_sweep(df: pd.DataFrame, lookback: int = 20, atr_mult: float = 0.08) -> Tuple[bool, bool]:
+    if df is None or len(df) < lookback + 5:
+        return False, False
+
+    d = df.tail(lookback + 2).copy()
+    a = atr(d, 14).iloc[-1]
+    a = float(a) if pd.notna(a) else 0.0
+    if a <= 0:
+        return False, False
+
+    prev_high = float(d["High"].iloc[:-1].max())
+    prev_low = float(d["Low"].iloc[:-1].min())
+
+    last_high = float(d["High"].iloc[-1])
+    last_low = float(d["Low"].iloc[-1])
+    last_close = float(d["Close"].iloc[-1])
+
+    sweep_buy = (last_low < (prev_low - atr_mult * a)) and (last_close > prev_low)
+    sweep_sell = (last_high > (prev_high + atr_mult * a)) and (last_close < prev_high)
+    return sweep_buy, sweep_sell
+
+
+def detect_bos_choch(df: pd.DataFrame, swing_lookback: int = 20) -> Tuple[bool, bool, bool, bool]:
+    if df is None or len(df) < swing_lookback + 10:
+        return False, False, False, False
+
+    d = df.tail(swing_lookback + 6).copy()
+    last_close = float(d["Close"].iloc[-1])
+
+    prev_high = float(d["High"].iloc[-(swing_lookback+1):-1].max())
+    prev_low = float(d["Low"].iloc[-(swing_lookback+1):-1].min())
+
+    bos_buy = last_close > prev_high
+    bos_sell = last_close < prev_low
+
+    recent = d.tail(6)
+    recent_up = float(recent["Close"].iloc[-2]) > float(recent["Close"].iloc[-6])
+    recent_down = float(recent["Close"].iloc[-2]) < float(recent["Close"].iloc[-6])
+
+    choch_buy = recent_down and bos_buy
+    choch_sell = recent_up and bos_sell
+
+    return bos_buy, bos_sell, choch_buy, choch_sell
+
+
+def detect_displacement(df: pd.DataFrame, body_mult: float = 1.5) -> Tuple[bool, bool]:
+    if df is None or len(df) < 20:
+        return False, False
+
+    d = df.tail(20).copy()
+    bodies = (d["Close"] - d["Open"]).abs()
+    avg_body = float(bodies.iloc[:-1].mean())
+    last_open = float(d["Open"].iloc[-1])
+    last_close = float(d["Close"].iloc[-1])
+    last_body = abs(last_close - last_open)
+
+    if avg_body <= 0:
+        return False, False
+
+    bullish = (last_close > last_open) and (last_body >= body_mult * avg_body)
+    bearish = (last_close < last_open) and (last_body >= body_mult * avg_body)
+    return bullish, bearish
+
+
+def analyze_structure(df: pd.DataFrame) -> StructureSignal:
+    trend, strength = detect_trend_strength(df, EMA_FAST, EMA_SLOW)
+    sweep_buy, sweep_sell = detect_liquidity_sweep(df, 20, 0.08)
+    bos_buy, bos_sell, choch_buy, choch_sell = detect_bos_choch(df, 20)
+    displacement_buy, displacement_sell = detect_displacement(df, 1.5)
+
+    return StructureSignal(
+        trend=trend,
+        bos_buy=bos_buy,
+        bos_sell=bos_sell,
+        choch_buy=choch_buy,
+        choch_sell=choch_sell,
+        sweep_buy=sweep_buy,
+        sweep_sell=sweep_sell,
+        displacement_buy=displacement_buy,
+        displacement_sell=displacement_sell,
+        strength=float(strength),
+    )
+
+
+# =========================
 # SCORING ENGINE
 # =========================
 def trend_bias_from_higher_tf(d1: pd.DataFrame, h4: pd.DataFrame) -> int:
@@ -557,6 +685,7 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
 
     trend_bias = trend_bias_from_higher_tf(d1, h4)
     wy = detect_wyckoff(m30, lookback=WYCKOFF_LOOKBACK)
+    st = analyze_structure(m30)
 
     # RSI
     buy_rsi = 0.0
@@ -613,21 +742,21 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     # Fibonacci
     buy_fib = 0.0
     sell_fib = 0.0
-    buy_fib62 = buy_fib79 = buy_high = buy_low = None
-    sell_fib62 = sell_fib79 = sell_high = sell_low = None
+    buy_fib62 = buy_fib79 = None
+    sell_fib62 = sell_fib79 = None
 
     fib_buy = fib_zone(m30, "BUY", FIB_LOOKBACK)
     fib_sell = fib_zone(m30, "SELL", FIB_LOOKBACK)
 
     if fib_buy:
-        buy_fib62, buy_fib79, buy_high, buy_low = fib_buy
+        buy_fib62, buy_fib79, _, _ = fib_buy
         lo = min(buy_fib62, buy_fib79)
         hi = max(buy_fib62, buy_fib79)
         if lo <= last_close <= hi:
             buy_fib = 1.8
 
     if fib_sell:
-        sell_fib62, sell_fib79, sell_high, sell_low = fib_sell
+        sell_fib62, sell_fib79, _, _ = fib_sell
         lo = min(sell_fib62, sell_fib79)
         hi = max(sell_fib62, sell_fib79)
         if lo <= last_close <= hi:
@@ -653,6 +782,35 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
     elif trend_bias == -1:
         sell_bias = 0.6
 
+    # Trend strength filter
+    buy_trend = 0.0
+    sell_trend = 0.0
+    if st.trend == "bullish":
+        buy_trend = 1.8 if st.strength >= 8 else 1.0
+        if st.strength >= 8:
+            sell_momentum -= 1.0
+            sell_macd -= 0.8
+            sell_sr -= 0.5
+    elif st.trend == "bearish":
+        sell_trend = 1.8 if st.strength >= 8 else 1.0
+        if st.strength >= 8:
+            buy_momentum -= 1.0
+            buy_macd -= 0.8
+            buy_sr -= 0.5
+
+    # SMC Layers
+    buy_liquidity = 1.7 if st.sweep_buy else 0.0
+    sell_liquidity = 1.7 if st.sweep_sell else 0.0
+
+    buy_bos = 1.5 if st.bos_buy else 0.0
+    sell_bos = 1.5 if st.bos_sell else 0.0
+
+    buy_choch = 1.2 if st.choch_buy else 0.0
+    sell_choch = 1.2 if st.choch_sell else 0.0
+
+    buy_displacement = 1.1 if st.displacement_buy else 0.0
+    sell_displacement = 1.1 if st.displacement_sell else 0.0
+
     return {
         "meta": {
             "last_close": last_close,
@@ -673,6 +831,16 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
             "wy_range_high": wy.range_high,
             "wy_range_low": wy.range_low,
             "wy_volume_ratio": wy.volume_ratio,
+            "smc_trend": st.trend,
+            "smc_strength": st.strength,
+            "smc_sweep_buy": st.sweep_buy,
+            "smc_sweep_sell": st.sweep_sell,
+            "smc_bos_buy": st.bos_buy,
+            "smc_bos_sell": st.bos_sell,
+            "smc_choch_buy": st.choch_buy,
+            "smc_choch_sell": st.choch_sell,
+            "smc_disp_buy": st.displacement_buy,
+            "smc_disp_sell": st.displacement_sell,
         },
         "buy": {
             "rsi": buy_rsi,
@@ -683,6 +851,11 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
             "fibonacci": buy_fib,
             "sr": buy_sr,
             "wyckoff": wy.buy_score,
+            "trend": buy_trend,
+            "liquidity": buy_liquidity,
+            "bos": buy_bos,
+            "choch": buy_choch,
+            "displacement": buy_displacement,
             "bias": buy_bias,
         },
         "sell": {
@@ -694,6 +867,11 @@ def feature_scores(m30: pd.DataFrame, d1: pd.DataFrame, h4: pd.DataFrame, label:
             "fibonacci": sell_fib,
             "sr": sell_sr,
             "wyckoff": wy.sell_score,
+            "trend": sell_trend,
+            "liquidity": sell_liquidity,
+            "bos": sell_bos,
+            "choch": sell_choch,
+            "displacement": sell_displacement,
             "bias": sell_bias,
         },
     }
@@ -731,6 +909,16 @@ class Plan:
     wy_upthrust: bool
     wy_range_high: float
     wy_range_low: float
+    smc_trend: str
+    smc_strength: float
+    smc_sweep_buy: bool
+    smc_sweep_sell: bool
+    smc_bos_buy: bool
+    smc_bos_sell: bool
+    smc_choch_buy: bool
+    smc_choch_sell: bool
+    smc_disp_buy: bool
+    smc_disp_sell: bool
 
 
 def calc_rr_targets(entry: float, sl: float, side: str) -> Tuple[float, float, float]:
@@ -791,6 +979,16 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
     support = safe_float(meta["support"])
     resistance = safe_float(meta["resistance"])
 
+    # Hard anti-countertrend guard
+    smc_trend = str(meta.get("smc_trend", "neutral"))
+    smc_strength = float(meta.get("smc_strength", 0.0))
+    if side == "SELL" and smc_trend == "bullish" and smc_strength >= 8.0:
+        if not (bool(meta.get("smc_sweep_sell", False)) and (bool(meta.get("smc_bos_sell", False)) or bool(meta.get("smc_choch_sell", False)))):
+            return None
+    if side == "BUY" and smc_trend == "bearish" and smc_strength >= 8.0:
+        if not (bool(meta.get("smc_sweep_buy", False)) and (bool(meta.get("smc_bos_buy", False)) or bool(meta.get("smc_choch_buy", False)))):
+            return None
+
     fib_low = fib_high = None
     if side == "BUY" and meta["buy_fib62"] is not None and meta["buy_fib79"] is not None:
         fib_low = min(meta["buy_fib62"], meta["buy_fib79"])
@@ -824,9 +1022,7 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
         sl = (entry - 1.2 * a) if side == "BUY" else (entry + 1.2 * a)
 
     tp1, tp2, tp3 = calc_rr_targets(entry, sl, side)
-
-    confidence = max(buy_score, sell_score)
-    confidence = clamp(confidence, 1.0, 10.0)
+    confidence = clamp(max(buy_score, sell_score), 1.0, 10.0)
 
     features_used = buy_raw if side == "BUY" else sell_raw
     weighted_contributions = buy_contrib if side == "BUY" else sell_contrib
@@ -859,6 +1055,16 @@ def build_plan(state: dict, label: str, symbol: str) -> Optional[Plan]:
         wy_upthrust=bool(meta.get("wy_upthrust", False)),
         wy_range_high=float(meta.get("wy_range_high", 0.0)),
         wy_range_low=float(meta.get("wy_range_low", 0.0)),
+        smc_trend=str(meta.get("smc_trend", "neutral")),
+        smc_strength=float(meta.get("smc_strength", 0.0)),
+        smc_sweep_buy=bool(meta.get("smc_sweep_buy", False)),
+        smc_sweep_sell=bool(meta.get("smc_sweep_sell", False)),
+        smc_bos_buy=bool(meta.get("smc_bos_buy", False)),
+        smc_bos_sell=bool(meta.get("smc_bos_sell", False)),
+        smc_choch_buy=bool(meta.get("smc_choch_buy", False)),
+        smc_choch_sell=bool(meta.get("smc_choch_sell", False)),
+        smc_disp_buy=bool(meta.get("smc_disp_buy", False)),
+        smc_disp_sell=bool(meta.get("smc_disp_sell", False)),
     )
 
 
@@ -927,12 +1133,15 @@ def render_chart(df: pd.DataFrame, plan: Plan) -> bytes:
     feat_txt = " | ".join([f"{k}:{v:+.2f}" for k, v in top_feats])
 
     analysis_text = (
-        f"Adaptive Quant + Wyckoff\n"
+        f"Institutional Adaptive\n"
         f"BUY:{plan.buy_score:.2f} | SELL:{plan.sell_score:.2f}\n"
         f"RSI: {plan.rsi_value:.1f}\n"
         f"Wyckoff: {wy_txt}\n"
-        f"Support: {fmt_price(plan.label, plan.support, plan.entry)}\n"
-        f"Resistance: {fmt_price(plan.label, plan.resistance, plan.entry)}\n"
+        f"Trend: {plan.smc_trend} ({plan.smc_strength:.1f})\n"
+        f"Sweep: {'BUY' if plan.smc_sweep_buy else 'SELL' if plan.smc_sweep_sell else '—'} | "
+        f"BOS: {'BUY' if plan.smc_bos_buy else 'SELL' if plan.smc_bos_sell else '—'}\n"
+        f"CHOCH: {'BUY' if plan.smc_choch_buy else 'SELL' if plan.smc_choch_sell else '—'} | "
+        f"Disp: {'BUY' if plan.smc_disp_buy else 'SELL' if plan.smc_disp_sell else '—'}\n"
         f"Fib: {fib_txt}\n"
         f"Entry: {fmt_price(plan.label, plan.entry, plan.entry)}\n"
         f"SL: {fmt_price(plan.label, plan.sl, plan.entry)}\n"
@@ -1234,7 +1443,15 @@ def format_plan(plan: Plan) -> str:
     if plan.wy_upthrust:
         wy_txt += " | Upthrust ✅"
 
-    top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:4]
+    smc_txt = (
+        f"SMC Trend: {plan.smc_trend} ({plan.smc_strength:.1f}/10)\n"
+        f"Sweep: {'BUY' if plan.smc_sweep_buy else 'SELL' if plan.smc_sweep_sell else '—'} | "
+        f"BOS: {'BUY' if plan.smc_bos_buy else 'SELL' if plan.smc_bos_sell else '—'} | "
+        f"CHOCH: {'BUY' if plan.smc_choch_buy else 'SELL' if plan.smc_choch_sell else '—'} | "
+        f"Disp: {'BUY' if plan.smc_disp_buy else 'SELL' if plan.smc_disp_sell else '—'}"
+    )
+
+    top_feats = sorted(plan.weighted_contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
     top_txt = " | ".join([f"{k}:{v:+.2f}" for k, v in top_feats])
 
     return (
@@ -1244,6 +1461,7 @@ def format_plan(plan: Plan) -> str:
         f"SELL SCORE: {plan.sell_score:.2f}\n"
         f"RSI({RSI_PERIOD}): {plan.rsi_value:.1f}\n"
         f"Wyckoff: {wy_txt}\n"
+        f"{smc_txt}\n"
         f"Fib Zone: {fib_txt}\n\n"
         f"{side_emoji} {order}: {fmt_price(plan.label, plan.entry, px_hint)}\n"
         f"SL: {fmt_price(plan.label, plan.sl, px_hint)}\n"
@@ -1255,7 +1473,7 @@ def format_plan(plan: Plan) -> str:
         f"Risk: {RISK_PCT:.1f}% (~${plan.risk_usd:.2f})\n"
         f"Confidence: {plan.confidence:.1f}/10\n"
         f"Top Factors: {top_txt}\n"
-        f"Model: Adaptive Quant + Wyckoff\n"
+        f"Model: Institutional Adaptive + Wyckoff + SMC\n"
     )
 
 
@@ -1476,11 +1694,11 @@ def main():
         logger.info("Bot username: @%s", bot_username)
 
     state = load_state()
-    logger.info("Adaptive Quant + Wyckoff bot started | CHAT_ID=%s", CHAT_ID)
+    logger.info("Institutional Adaptive bot started | CHAT_ID=%s", CHAT_ID)
 
     tg_send_message(
         CHAT_ID,
-        "✅ Adaptive Quant + Wyckoff Bot Online (RSI + MACD + Volume + Momentum + ATR + Fib + S/R + Wyckoff + Learning). اكتب /help"
+        "✅ Institutional Adaptive Bot Online (RSI + MACD + Volume + Momentum + ATR + Fib + S/R + Wyckoff + SMC + Learning). اكتب /help"
     )
 
     last_check = 0.0
