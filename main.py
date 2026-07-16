@@ -1,199 +1,103 @@
+# -*- coding: utf-8 -*-
+
 import os
+import time
 import logging
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes
-)
+import requests
+import pandas as pd
+import yfinance as yf
 
 
-# إعداد السجل
+# =========================
+# LOGGING
+# =========================
+
 logging.basicConfig(
-    level=logging.INFO
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+
+logger = logging.getLogger("ProMax_VIP")
+
+
+# =========================
+# CONFIG
+# =========================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+
+
+CHECK_INTERVAL_SEC = int(
+    os.getenv("CHECK_INTERVAL_SEC", "300")
+)
+
+MIN_SIGNAL_SCORE = float(
+    os.getenv("MIN_SIGNAL_SCORE", "70")
 )
 
 
-# جلب التوكن من Railway Variables
-TOKEN = os.getenv("BOT_TOKEN")
-
-
-if not TOKEN:
-    raise ValueError(
-        "BOT_TOKEN غير موجود في Railway Variables"
-    )
-
-
-SYMBOLS = [
-    "XAUUSD",
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "BTCUSD",
-    "US100",
-    "US30",
-    "GER40",
-    "WTI"
-]
-
-
-MIN_SIGNAL = 70
 LOT = 0.01
 
 
+# =========================
+# SYMBOLS
+# =========================
 
-def analyze_market(symbol):
+SYMBOLS = {
 
-    score = 0
-    reasons = []
+    "XAUUSD": "GC=F",
+
+    "EURUSD": "EURUSD=X",
+
+    "USDJPY": "USDJPY=X",
+
+    "BTCUSD": "BTC-USD",
+
+    "US100": "NQ=F",
+
+    "US30": "^DJI",
+
+    "GER40": "^GDAXI",
+
+    "WTI": "CL=F"
+
+}
 
 
-    # اختبار مبدئي
-    conditions = {
+# =========================
+# TELEGRAM SEND
+# =========================
 
-        "trend": True,
-        "rsi": True,
-        "macd": True,
-        "candle": True
+def send_telegram(message):
 
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.warning(
+            "Telegram variables missing"
+        )
+        return
+
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
+
+
+    data = {
+        "chat_id": CHAT_ID,
+        "text": message
     }
 
 
-    if conditions["trend"]:
-        score += 30
-        reasons.append("الاتجاه متوافق")
+    try:
 
-
-    if conditions["rsi"]:
-        score += 20
-        reasons.append("RSI داعم")
-
-
-    if conditions["macd"]:
-        score += 20
-        reasons.append("MACD داعم")
-
-
-    if conditions["candle"]:
-        score += 30
-        reasons.append("تأكيد شمعة")
-
-
-    signal = "BUY" if score >= MIN_SIGNAL else "WAIT"
-
-
-    return {
-        "symbol": symbol,
-        "signal": signal,
-        "score": score,
-        "reasons": reasons
-    }
-
-
-
-def trade_levels():
-
-    entry = 100
-    sl = 98
-    tp1 = 103
-    tp2 = 104
-
-    return entry, sl, tp1, tp2
-
-
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "⭐ ProMax VIP يعمل على Railway\n\n"
-        "/analyze لتحليل الأسواق"
-    )
-
-
-
-async def analyze(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    message = "⭐ ProMax VIP SIGNALS\n\n"
-
-
-    for symbol in SYMBOLS:
-
-        result = analyze_market(symbol)
-
-
-        if result["score"] >= MIN_SIGNAL:
-
-            entry, sl, tp1, tp2 = trade_levels()
-
-
-            message += f"""
-📌 {symbol}
-
-🟢 {result['signal']}
-
-القوة:
-{result['score']}%
-
-Lot:
-{LOT}
-
-Entry:
-{entry}
-
-SL:
-{sl}
-
-TP1:
-{tp1}
-
-TP2:
-{tp2}
-
-"""
-
-
-    await update.message.reply_text(message)
-
-
-
-def main():
-
-    app = Application.builder()\
-        .token(TOKEN)\
-        .build()
-
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
+        requests.post(
+            url,
+            data=data,
+            timeout=15
         )
-    )
 
+    except Exception as e:
 
-    app.add_handler(
-        CommandHandler(
-            "analyze",
-            analyze
-        )
-    )
-
-
-    print(
-        "⭐ ProMax VIP Railway Running"
-    )
-
-
-    app.run_polling()
-
-
-
-if __name__ == "__main__":
-    main()
+        logger.error(e)
