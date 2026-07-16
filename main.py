@@ -1,4 +1,5 @@
-# ProMax VIP V1 - Single File
+import os
+import logging
 
 from telegram import Update
 from telegram.ext import (
@@ -8,15 +9,20 @@ from telegram.ext import (
 )
 
 
-# ==========================
-# الإعدادات
-# ==========================
+# إعداد السجل
+logging.basicConfig(
+    level=logging.INFO
+)
 
-BOT_TOKEN = "8318064533:AAGemv00llTYPiu3-5jQpRb_m-h_TWc7D1U"
 
-LOT = 0.01
+# جلب التوكن من Railway Variables
+TOKEN = os.getenv("BOT_TOKEN")
 
-MIN_SIGNAL = 70
+
+if not TOKEN:
+    raise ValueError(
+        "BOT_TOKEN غير موجود في Railway Variables"
+    )
 
 
 SYMBOLS = [
@@ -32,9 +38,10 @@ SYMBOLS = [
 ]
 
 
-# ==========================
-# محرك التحليل
-# ==========================
+MIN_SIGNAL = 70
+LOT = 0.01
+
+
 
 def analyze_market(symbol):
 
@@ -42,91 +49,59 @@ def analyze_market(symbol):
     reasons = []
 
 
-    # بيانات تجريبية
-    trend = True
-    rsi = True
-    macd = True
-    candle = True
+    # اختبار مبدئي
+    conditions = {
 
-
-    if trend:
-        score += 30
-        reasons.append(
-            "اتجاه السوق متوافق"
-        )
-
-
-    if rsi:
-        score += 20
-        reasons.append(
-            "RSI داعم"
-        )
-
-
-    if macd:
-        score += 20
-        reasons.append(
-            "MACD داعم"
-        )
-
-
-    if candle:
-        score += 30
-        reasons.append(
-            "شمعة تأكيد"
-        )
-
-
-    if score >= MIN_SIGNAL:
-
-        signal = "BUY"
-
-    else:
-
-        signal = "WAIT"
-
-
-
-    return {
-
-        "symbol": symbol,
-        "signal": signal,
-        "score": score,
-        "reasons": reasons
+        "trend": True,
+        "rsi": True,
+        "macd": True,
+        "candle": True
 
     }
 
 
+    if conditions["trend"]:
+        score += 30
+        reasons.append("الاتجاه متوافق")
 
-# ==========================
-# إدارة الصفقة
-# ==========================
 
-def calculate_trade(signal):
+    if conditions["rsi"]:
+        score += 20
+        reasons.append("RSI داعم")
+
+
+    if conditions["macd"]:
+        score += 20
+        reasons.append("MACD داعم")
+
+
+    if conditions["candle"]:
+        score += 30
+        reasons.append("تأكيد شمعة")
+
+
+    signal = "BUY" if score >= MIN_SIGNAL else "WAIT"
+
+
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "score": score,
+        "reasons": reasons
+    }
+
+
+
+def trade_levels():
 
     entry = 100
-    atr = 2
+    sl = 98
+    tp1 = 103
+    tp2 = 104
+
+    return entry, sl, tp1, tp2
 
 
-    if signal == "BUY":
-
-        return {
-
-            "entry": entry,
-            "sl": entry - atr,
-            "tp1": entry + atr * 1.5,
-            "tp2": entry + atr * 2
-
-        }
-
-
-    return None
-
-
-
-# ==========================
-# Telegram
-# ==========================
 
 async def start(
     update: Update,
@@ -134,15 +109,9 @@ async def start(
 ):
 
     await update.message.reply_text(
-"""
-⭐ ProMax VIP V1
-
-بوت التحليل اليومي
-
-/analyze
-للحصول على الإشارات
-"""
-)
+        "⭐ ProMax VIP يعمل على Railway\n\n"
+        "/analyze لتحليل الأسواق"
+    )
 
 
 
@@ -151,25 +120,20 @@ async def analyze(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-
-    msg = "⭐ ProMax VIP SIGNALS\n\n"
+    message = "⭐ ProMax VIP SIGNALS\n\n"
 
 
     for symbol in SYMBOLS:
-
 
         result = analyze_market(symbol)
 
 
         if result["score"] >= MIN_SIGNAL:
 
-
-            trade = calculate_trade(
-                result["signal"]
-            )
+            entry, sl, tp1, tp2 = trade_levels()
 
 
-            msg += f"""
+            message += f"""
 📌 {symbol}
 
 🟢 {result['signal']}
@@ -181,46 +145,29 @@ Lot:
 {LOT}
 
 Entry:
-{trade['entry']}
+{entry}
 
 SL:
-{trade['sl']}
+{sl}
 
 TP1:
-{trade['tp1']}
+{tp1}
 
 TP2:
-{trade['tp2']}
+{tp2}
 
-التحليل:
 """
 
 
-            for r in result["reasons"]:
-
-                msg += f"✅ {r}\n"
+    await update.message.reply_text(message)
 
 
-            msg += "\n"
-
-
-
-    await update.message.reply_text(
-        msg
-    )
-
-
-
-# ==========================
-# تشغيل البوت
-# ==========================
 
 def main():
 
-
-    app = Application.builder().token(
-        BOT_TOKEN
-    ).build()
+    app = Application.builder()\
+        .token(TOKEN)\
+        .build()
 
 
     app.add_handler(
@@ -240,7 +187,7 @@ def main():
 
 
     print(
-        "⭐ ProMax VIP Started"
+        "⭐ ProMax VIP Railway Running"
     )
 
 
@@ -249,5 +196,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
