@@ -547,3 +547,61 @@ Analysis:
                 chart,
                 text
             )
+# =========================
+# MAIN LOOP
+# =========================
+
+def main():
+
+    logger.info(
+        "⭐ ProMax VIP Started"
+    )
+
+
+    if not BOT_TOKEN or not CHAT_ID:
+
+        logger.error(
+            "Missing BOT_TOKEN or CHAT_ID"
+        )
+
+        return
+
+
+
+    while True:
+
+        try:
+
+            logger.info(
+                "Scanning markets..."
+            )
+
+
+            scan_market()
+
+
+            logger.info(
+                "Scan completed"
+            )
+
+
+        except Exception as e:
+
+            logger.error(
+                f"MAIN ERROR: {e}"
+            )
+
+
+        time.sleep(
+            CHECK_INTERVAL_SEC
+        )
+
+
+
+# =========================
+# START
+# =========================
+
+if __name__ == "__main__":
+
+    main()
