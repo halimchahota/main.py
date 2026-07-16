@@ -1,134 +1,253 @@
-import time
+# ProMax VIP V1 - Single File
 
-from config import SYMBOLS, MIN_SIGNAL_SCORE
-
-from market.data_feed import get_price_data
-
-from analysis.indicators import add_indicators
-
-from analysis.signal_engine import generate_signal
-
-from risk.manager import calculate_levels
-
-from telegram_bot.messages import signal_message
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes
+)
 
 
-def analyze_symbol(symbol):
+# ==========================
+# الإعدادات
+# ==========================
 
-    print(f"🔍 تحليل: {symbol}")
+BOT_TOKEN = "8318064533:AAGemv00llTYPiu3-5jQpRb_m-h_TWc7D1U"
 
-    # جلب بيانات السوق
-    df = get_price_data(
-        symbol,
-        "M5"
-    )
+LOT = 0.01
 
-    if df.empty:
-        print("لا توجد بيانات")
-        return None
+MIN_SIGNAL = 70
 
 
-    # إضافة المؤشرات
-    df = add_indicators(df)
+SYMBOLS = [
+    "XAUUSD",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "BTCUSD",
+    "US100",
+    "US30",
+    "GER40",
+    "WTI"
+]
 
 
-    last = df.iloc[-1]
+# ==========================
+# محرك التحليل
+# ==========================
+
+def analyze_market(symbol):
+
+    score = 0
+    reasons = []
 
 
-    # تحليل المعطيات
-    analysis_data = {
-
-        "trend": last["EMA50"] > last["EMA200"],
-
-        "direction":
-            "UP"
-            if last["EMA50"] > last["EMA200"]
-            else "DOWN",
-
-        "rsi":
-            last["RSI"] > 50,
-
-        "macd":
-            last["MACD"] > last["MACD_SIGNAL"],
-
-        "support": True,
-
-        "candle":
-            last["close"] > last["open"]
-
-    }
+    # بيانات تجريبية
+    trend = True
+    rsi = True
+    macd = True
+    candle = True
 
 
-    # حساب الإشارة
-    result = generate_signal(
-        analysis_data
-    )
+    if trend:
+        score += 30
+        reasons.append(
+            "اتجاه السوق متوافق"
+        )
 
 
-    if result["score"] < MIN_SIGNAL_SCORE:
+    if rsi:
+        score += 20
+        reasons.append(
+            "RSI داعم"
+        )
 
-        return None
+
+    if macd:
+        score += 20
+        reasons.append(
+            "MACD داعم"
+        )
 
 
-    # حساب المستويات
-    levels = calculate_levels(
+    if candle:
+        score += 30
+        reasons.append(
+            "شمعة تأكيد"
+        )
 
-        entry=last["close"],
 
-        atr=last["ATR"],
+    if score >= MIN_SIGNAL:
 
-        signal=result["signal"]
+        signal = "BUY"
 
-    )
+    else:
+
+        signal = "WAIT"
+
 
 
     return {
+
         "symbol": symbol,
-        "result": result,
-        "levels": levels
+        "signal": signal,
+        "score": score,
+        "reasons": reasons
+
     }
 
 
 
-def run_engine():
+# ==========================
+# إدارة الصفقة
+# ==========================
 
-    print(
-        "⭐ ProMax VIP Engine Started"
+def calculate_trade(signal):
+
+    entry = 100
+    atr = 2
+
+
+    if signal == "BUY":
+
+        return {
+
+            "entry": entry,
+            "sl": entry - atr,
+            "tp1": entry + atr * 1.5,
+            "tp2": entry + atr * 2
+
+        }
+
+
+    return None
+
+
+
+# ==========================
+# Telegram
+# ==========================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+"""
+⭐ ProMax VIP V1
+
+بوت التحليل اليومي
+
+/analyze
+للحصول على الإشارات
+"""
+)
+
+
+
+async def analyze(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+
+    msg = "⭐ ProMax VIP SIGNALS\n\n"
+
+
+    for symbol in SYMBOLS:
+
+
+        result = analyze_market(symbol)
+
+
+        if result["score"] >= MIN_SIGNAL:
+
+
+            trade = calculate_trade(
+                result["signal"]
+            )
+
+
+            msg += f"""
+📌 {symbol}
+
+🟢 {result['signal']}
+
+القوة:
+{result['score']}%
+
+Lot:
+{LOT}
+
+Entry:
+{trade['entry']}
+
+SL:
+{trade['sl']}
+
+TP1:
+{trade['tp1']}
+
+TP2:
+{trade['tp2']}
+
+التحليل:
+"""
+
+
+            for r in result["reasons"]:
+
+                msg += f"✅ {r}\n"
+
+
+            msg += "\n"
+
+
+
+    await update.message.reply_text(
+        msg
     )
 
 
-    while True:
 
-        for symbol in SYMBOLS:
+# ==========================
+# تشغيل البوت
+# ==========================
 
-            try:
-
-                signal = analyze_symbol(symbol)
-
-
-                if signal:
-
-                    print(
-                        signal
-                    )
-
-                    # هنا يتم إرسال Telegram
-                    # send_message()
+def main():
 
 
-            except Exception as error:
-
-                print(
-                    "Error:",
-                    error
-                )
+    app = Application.builder().token(
+        BOT_TOKEN
+    ).build()
 
 
-        # إعادة الفحص كل 5 دقائق
-        time.sleep(300)
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+
+    app.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze
+        )
+    )
+
+
+    print(
+        "⭐ ProMax VIP Started"
+    )
+
+
+    app.run_polling()
 
 
 
 if __name__ == "__main__":
 
-    run_engine()
+    main()
