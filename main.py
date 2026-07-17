@@ -6,7 +6,6 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
 
 import matplotlib
 matplotlib.use("Agg")
@@ -26,19 +25,31 @@ logger = logging.getLogger("ProMax_VIP")
 
 
 # =========================
-# RAILWAY CONFIG
+# RAILWAY VARIABLES
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
+TWELVE_API_KEY = os.getenv(
+    "TWELVE_API_KEY",
+    ""
+).strip()
 
-CHECK_INTERVAL_SEC = int(
-    os.getenv("CHECK_INTERVAL_SEC", "300")
+
+CHECK_INTERVAL = int(
+    os.getenv(
+        "CHECK_INTERVAL_SEC",
+        "300"
+    )
 )
 
-MIN_SIGNAL_SCORE = float(
-    os.getenv("MIN_SIGNAL_SCORE", "70")
+
+MIN_SIGNAL = float(
+    os.getenv(
+        "MIN_SIGNAL_SCORE",
+        "70"
+    )
 )
 
 
@@ -46,28 +57,28 @@ LOT = 0.01
 
 
 # =========================
-# SYMBOLS
+# MARKETS
 # =========================
 
 SYMBOLS = {
 
-    "XAUUSD": "GC=F",
+    "XAUUSD": "XAU/USD",
 
-    "EURUSD": "EURUSD=X",
+    "EURUSD": "EUR/USD",
 
-    "GBPUSD": "GBPUSD=X",
+    "GBPUSD": "GBP/USD",
 
-    "USDJPY": "USDJPY=X",
+    "USDJPY": "USD/JPY",
 
-    "BTCUSD": "BTC-USD",
+    "BTCUSD": "BTC/USD",
 
-    "US100": "NQ=F",
+    "US100": "IXIC",
 
-    "US30": "^DJI",
+    "US30": "DJI",
 
-    "GER40": "^GDAXI",
+    "GER40": "DAX",
 
-    "WTI": "CL=F"
+    "WTI": "WTI"
 
 }
 
@@ -76,17 +87,14 @@ SYMBOLS = {
 # TELEGRAM
 # =========================
 
-def send_message(text):
+def send_text(message):
 
     if not BOT_TOKEN or not CHAT_ID:
-        logger.error(
-            "BOT_TOKEN or CHAT_ID missing"
-        )
         return
 
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{BOT_TOKEN}/sendMessage"
     )
 
@@ -97,10 +105,11 @@ def send_message(text):
             url,
             data={
                 "chat_id": CHAT_ID,
-                "text": text
+                "text": message
             },
             timeout=15
         )
+
 
     except Exception as e:
 
@@ -108,21 +117,21 @@ def send_message(text):
 
 
 
-def send_photo(path, caption):
+def send_image(path, caption):
 
     if not BOT_TOKEN or not CHAT_ID:
         return
 
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{BOT_TOKEN}/sendPhoto"
     )
 
 
     try:
 
-        with open(path, "rb") as photo:
+        with open(path, "rb") as img:
 
             requests.post(
                 url,
@@ -131,10 +140,11 @@ def send_photo(path, caption):
                     "caption": caption
                 },
                 files={
-                    "photo": photo
+                    "photo": img
                 },
                 timeout=30
             )
+
 
     except Exception as e:
 
@@ -143,71 +153,134 @@ def send_photo(path, caption):
 
 
 # =========================
-# PRICE DATA
+# TWELVE DATA CANDLES
 # =========================
 
-def get_data(symbol):
+def get_candles(symbol):
+
+    url = "https://api.twelvedata.com/time_series"
+
+
+    params = {
+
+        "symbol": symbol,
+
+        "interval": "1h",
+
+        "outputsize": 200,
+
+        "apikey": TWELVE_API_KEY
+
+    }
+
 
     try:
 
-        df = yf.download(
-            symbol,
-            period="3mo",
-            interval="1h",
-            progress=False
+        response = requests.get(
+            url,
+            params=params,
+            timeout=20
         )
 
 
-        if df.empty:
+        data = response.json()
+
+
+        if "values" not in data:
+
+            logger.warning(
+                f"No data {symbol}: {data}"
+            )
+
             return None
+
+
+
+        df = pd.DataFrame(
+            data["values"]
+        )
+
+
+        df = df.rename(
+            columns={
+
+                "datetime": "time",
+
+                "open": "open",
+
+                "high": "high",
+
+                "low": "low",
+
+                "close": "close"
+
+            }
+        )
+
+
+        for col in [
+            "open",
+            "high",
+            "low",
+            "close"
+        ]:
+
+            df[col] = (
+                pd.to_numeric(
+                    df[col]
+                )
+            )
+
+
+        df = df.sort_values(
+            "time"
+        )
 
 
         return df
 
 
+
     except Exception as e:
 
         logger.error(
-            f"DATA ERROR {symbol}: {e}"
+            f"API ERROR {symbol}: {e}"
         )
 
         return None
-
-
-
-# =========================
+        # =========================
 # INDICATORS
 # =========================
 
-def indicators(df):
-
-    close = df["Close"]
-
+def add_indicators(df):
 
     df["EMA20"] = (
-        close.ewm(span=20)
+        df["close"]
+        .ewm(span=20)
         .mean()
     )
-
 
     df["EMA50"] = (
-        close.ewm(span=50)
+        df["close"]
+        .ewm(span=50)
         .mean()
     )
 
 
-    delta = close.diff()
+    # RSI
+
+    delta = df["close"].diff()
 
 
     gain = (
-        delta.where(delta > 0, 0)
+        delta.clip(lower=0)
         .rolling(14)
         .mean()
     )
 
 
     loss = (
-        -delta.where(delta < 0, 0)
+        -delta.clip(upper=0)
         .rolling(14)
         .mean()
     )
@@ -217,18 +290,57 @@ def indicators(df):
 
 
     df["RSI"] = (
-        100 - (100 / (1 + rs))
+        100 - (100/(1+rs))
+    )
+
+
+    # MACD
+
+    ema12 = (
+        df["close"]
+        .ewm(span=12)
+        .mean()
+    )
+
+    ema26 = (
+        df["close"]
+        .ewm(span=26)
+        .mean()
+    )
+
+
+    df["MACD"] = (
+        ema12 - ema26
+    )
+
+
+    # ATR
+
+    high_low = (
+        df["high"]
+        -
+        df["low"]
+    )
+
+
+    df["ATR"] = (
+        high_low
+        .rolling(14)
+        .mean()
     )
 
 
     return df
-    # =========================
-# SIGNAL ENGINE
+
+
+
+# =========================
+# ANALYSIS
 # =========================
 
 def analyze(df):
 
-    df = indicators(df)
+    df = add_indicators(df)
 
 
     last = df.iloc[-1]
@@ -240,32 +352,32 @@ def analyze(df):
 
 
     price = float(
-        last["Close"]
+        last["close"]
     )
 
 
-    # TREND
+    # Trend
 
     if last["EMA20"] > last["EMA50"]:
+
+        direction = "BUY"
 
         score += 30
 
         reasons.append(
-            "الاتجاه صاعد EMA20>EMA50"
+            "Trend صاعد"
         )
-
-        direction = "BUY"
 
 
     else:
 
+        direction = "SELL"
+
         score += 30
 
         reasons.append(
-            "الاتجاه هابط EMA20<EMA50"
+            "Trend هابط"
         )
-
-        direction = "SELL"
 
 
 
@@ -297,24 +409,12 @@ def analyze(df):
 
     # MACD
 
-    ema12 = (
-        df["Close"]
-        .ewm(span=12)
-        .mean()
+    macd = float(
+        last["MACD"]
     )
 
 
-    ema26 = (
-        df["Close"]
-        .ewm(span=26)
-        .mean()
-    )
-
-
-    macd = ema12 - ema26
-
-
-    if direction == "BUY" and macd.iloc[-1] > 0:
+    if direction == "BUY" and macd > 0:
 
         score += 20
 
@@ -323,7 +423,7 @@ def analyze(df):
         )
 
 
-    elif direction == "SELL" and macd.iloc[-1] < 0:
+    elif direction == "SELL" and macd < 0:
 
         score += 20
 
@@ -335,16 +435,20 @@ def analyze(df):
 
     # Candle confirmation
 
-    if abs(
-        float(last["Close"])
-        -
-        float(last["Open"])
-    ) > 0:
+    if last["close"] > last["open"]:
 
         score += 10
 
         reasons.append(
-            "شمعة تأكيد"
+            "شمعة صاعدة"
+        )
+
+    else:
+
+        score += 10
+
+        reasons.append(
+            "شمعة هابطة"
         )
 
 
@@ -352,54 +456,64 @@ def analyze(df):
 
         "direction": direction,
 
-        "score": round(score,1),
+        "price": round(
+            price,
+            5
+        ),
 
-        "price": round(price,5),
+        "score": round(
+            score,
+            1
+        ),
 
-        "reasons": reasons
+        "reasons": reasons,
+
+        "df": df
 
     }
 
 
 
 # =========================
-# RISK LEVELS
+# SL TP
 # =========================
 
-def levels(price, direction):
+def calculate_levels(
+    price,
+    direction
+):
 
-
-    risk = price * 0.003
+    distance = price * 0.003
 
 
     if direction == "BUY":
 
-        return {
+        return (
 
-            "entry": price,
+            price,
 
-            "sl": price-risk,
+            price-distance,
 
-            "tp1": price+(risk*2),
+            price+(distance*2),
 
-            "tp2": price+(risk*3)
+            price+(distance*3)
 
-        }
+        )
 
 
     else:
 
-        return {
+        return (
 
-            "entry": price,
+            price,
 
-            "sl": price+risk,
+            price+distance,
 
-            "tp1": price-(risk*2),
+            price-(distance*2),
 
-            "tp2": price-(risk*3)
+            price-(distance*3)
 
-        }
+        )
 
 
 
@@ -407,19 +521,24 @@ def levels(price, direction):
 # CHART
 # =========================
 
-def create_chart(df, symbol, signal):
+def create_chart(
+    df,
+    symbol,
+    direction
+):
 
-
-    path = "/tmp/chart.png"
+    path = (
+        f"/tmp/{symbol}.png"
+    )
 
 
     plt.figure(
-        figsize=(10,5)
+        figsize=(12,6)
     )
 
 
     plt.plot(
-        df["Close"],
+        df["close"],
         label="Price"
     )
 
@@ -437,7 +556,7 @@ def create_chart(df, symbol, signal):
 
 
     plt.title(
-        f"{symbol} {signal}"
+        f"{symbol} {direction}"
     )
 
 
@@ -457,43 +576,47 @@ def create_chart(df, symbol, signal):
 
 
     return path
-
-
-
-# =========================
-# SCANNER
+    # =========================
+# MARKET SCANNER
 # =========================
 
 def scan_market():
 
+    for name, symbol in SYMBOLS.items():
 
-    for name, ticker in SYMBOLS.items():
+        logger.info(
+            f"Checking {name}"
+        )
 
 
-        data = get_data(ticker)
+        df = get_candles(symbol)
 
 
-        if data is None:
+        if df is None:
 
             continue
 
 
-        result = analyze(data)
+        result = analyze(df)
 
 
-        if result["score"] >= MIN_SIGNAL_SCORE:
+        if result["score"] < MIN_SIGNAL:
+
+            continue
 
 
-            trade = levels(
 
-                result["price"],
+        entry, sl, tp1, tp2 = calculate_levels(
 
-                result["direction"]
+            result["price"],
 
-            )
+            result["direction"]
+
+        )
 
 
-            text = f"""
+
+        message = f"""
 ⭐ ProMax VIP SIGNAL
 
 📌 {name}
@@ -509,46 +632,54 @@ def scan_market():
 📦 Lot:
 {LOT}
 
-Entry:
-{trade['entry']}
+🎯 Entry:
+{entry}
 
-SL:
-{trade['sl']}
+🛑 Stop Loss:
+{sl}
 
-TP1:
-{trade['tp1']}
+✅ TP1:
+{tp1}
 
-TP2:
-{trade['tp2']}
+✅ TP2:
+{tp2}
 
 
-Analysis:
+📈 Analysis:
 """
 
 
-            for r in result["reasons"]:
+        for item in result["reasons"]:
 
-                text += f"\n✅ {r}"
-
-
-
-            chart = create_chart(
-
-                data,
-
-                name,
-
-                result["direction"]
-
+            message += (
+                f"\n✅ {item}"
             )
 
 
-            send_photo(
-                chart,
-                text
-            )
+
+        chart = create_chart(
+
+            result["df"],
+
+            name,
+
+            result["direction"]
+
+        )
+
+
+        send_image(
+
+            chart,
+
+            message
+
+        )
+
+
+
 # =========================
-# MAIN LOOP
+# START LOOP
 # =========================
 
 def main():
@@ -558,10 +689,10 @@ def main():
     )
 
 
-    if not BOT_TOKEN or not CHAT_ID:
+    if not TWELVE_API_KEY:
 
         logger.error(
-            "Missing BOT_TOKEN or CHAT_ID"
+            "Missing TWELVE_API_KEY"
         )
 
         return
@@ -570,36 +701,28 @@ def main():
 
     while True:
 
+
         try:
 
-            logger.info(
-                "Scanning markets..."
-            )
-
-
             scan_market()
-
-
-            logger.info(
-                "Scan completed"
-            )
 
 
         except Exception as e:
 
             logger.error(
-                f"MAIN ERROR: {e}"
+                f"ERROR: {e}"
             )
 
 
+
         time.sleep(
-            CHECK_INTERVAL_SEC
+            CHECK_INTERVAL
         )
 
 
 
 # =========================
-# START
+# RUN
 # =========================
 
 if __name__ == "__main__":
