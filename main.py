@@ -35,7 +35,7 @@ logger = logging.getLogger("institutional_adaptive_bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-HuACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "45"))
