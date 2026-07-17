@@ -1654,4 +1654,160 @@ def handle_command(state: dict, update: dict, bot_username: Optional[str]) -> No
             tg_send_message(chat_id, "❌ الرمز غير معروف. جرّب /symbols")
             return
 
-<
+        if not market_is_open_for_symbol(sym_key):
+            tg_send_message(chat_id, f"🚫 السوق مغلق الآن لـ {sym_key}.")
+            return
+
+        if not session_allowed_for_symbol(sym_key):
+            tg_send_message(chat_id, f"⏰ {sym_key} خارج الجلسة المسموح بها.")
+            return
+
+        plan = build_plan(state, sym_key, SYMBOLS[sym_key])
+        if plan is None:
+            tg_send_message(chat_id, f"⚠️ لا توجد إشارة حالياً لـ {sym_key}.")
+            return
+
+        m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
+        if m30 is None or m30.empty:
+            tg_send_message(chat_id, "⚠️ تعذر جلب بيانات الشارت.")
+            return
+
+        tg_send_message(chat_id, format_plan(plan))
+        try:
+            img = render_chart(m30, plan)
+            ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+            if not ok:
+                tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+        except Exception as e:
+            tg_send_message(chat_id, f"⚠️ Chart error for {plan.label}: {e}")
+
+        register_trade_for_daily(state, plan)
+        save_state(state)
+        return
+
+    if cmd == "/scan":
+        plans: List[Tuple[float, Plan]] = []
+        for k, sym in SYMBOLS.items():
+            if not market_is_open_for_symbol(k):
+                continue
+            if not session_allowed_for_symbol(k):
+                continue
+            p = build_plan(state, k, sym)
+            if p is None:
+                continue
+            if p.confidence < MIN_CONF_SCAN:
+                continue
+            plans.append((p.confidence, p))
+
+        if not plans:
+            tg_send_message(chat_id, "⚠️ لا توجد إشارات قوية حالياً.")
+            return
+
+        plans.sort(key=lambda x: x[0], reverse=True)
+        top = [p for _, p in plans[:max(1, SCAN_TOP_N)]]
+
+        for i, plan in enumerate(top, start=1):
+            m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
+            if m30 is None or m30.empty:
+                continue
+
+            tg_send_message(chat_id, f"🔥 TOP AI SIGNAL #{i}\n\n" + format_plan(plan))
+            try:
+                img = render_chart(m30, plan)
+                ok = tg_send_photo(chat_id, f"📉 Technical Chart - {plan.label}", img)
+                if not ok:
+                    tg_send_message(chat_id, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+            except Exception as e:
+                tg_send_message(chat_id, f"⚠️ Chart error for {plan.label}: {e}")
+
+            register_trade_for_daily(state, plan)
+            save_state(state)
+            time.sleep(1)
+        return
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.error("Missing BOT_TOKEN or CHAT_ID.")
+        return
+
+    tg_delete_webhook()
+
+    me = tg_get_me()
+    bot_username = me.get("username") if me else None
+    if bot_username:
+        logger.info("Bot username: @%s", bot_username)
+
+    state = load_state()
+    logger.info("Institutional Adaptive bot started | CHAT_ID=%s", CHAT_ID)
+
+    tg_send_message(
+        CHAT_ID,
+        "✅ Institutional Adaptive Bot Online (RSI + MACD + Volume + Momentum + ATR + Fib + S/R + Wyckoff + SMC + Learning). اكتب /help"
+    )
+
+    last_check = 0.0
+
+    while True:
+        try:
+            update_trade_outcomes(state)
+            maybe_send_daily_report(state)
+
+            offset = int(state.get("tg_offset", 0))
+            upd = tg_get_updates(offset)
+            if upd.get("ok") and upd.get("result"):
+                for u in upd["result"]:
+                    state["tg_offset"] = u["update_id"] + 1
+                    handle_command(state, u, bot_username)
+                save_state(state)
+
+            if state.get("paused", False):
+                time.sleep(1)
+                continue
+
+            now = time.time()
+            if now - last_check < CHECK_INTERVAL_SEC:
+                time.sleep(1)
+                continue
+            last_check = now
+
+            for label, sym in SYMBOLS.items():
+                if not market_is_open_for_symbol(label):
+                    continue
+                if not session_allowed_for_symbol(label):
+                    continue
+
+                plan = build_plan(state, label, sym)
+                if plan is None:
+                    continue
+                if not should_send(state, plan):
+                    continue
+
+                m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
+                if m30 is None or m30.empty:
+                    continue
+
+                tg_send_message(CHAT_ID, format_plan(plan))
+                try:
+                    img = render_chart(m30, plan)
+                    ok = tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
+                    if not ok:
+                        tg_send_message(CHAT_ID, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+                except Exception as e:
+                    tg_send_message(CHAT_ID, f"⚠️ Chart error for {plan.label}: {e}")
+
+                mark_sent(state, plan)
+                register_trade_for_daily(state, plan)
+                save_state(state)
+                time.sleep(1)
+
+        except Exception as e:
+            logger.exception("Main loop error: %s", e)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
