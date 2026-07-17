@@ -5,11 +5,9 @@ import time
 import logging
 import requests
 import pandas as pd
-import numpy as np
+import yfinance as yf
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from datetime import datetime
 
 
 # =========================
@@ -17,314 +15,257 @@ import matplotlib.pyplot as plt
 # =========================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
-
-logger = logging.getLogger("ProMax_VIP")
-
-
-# =========================
-# RAILWAY VARIABLES
-# =========================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-
-TWELVE_API_KEY = os.getenv(
-    "TWELVE_API_KEY",
-    ""
-).strip()
-
-
-CHECK_INTERVAL = int(
-    os.getenv(
-        "CHECK_INTERVAL_SEC",
-        "300"
-    )
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 
-MIN_SIGNAL = float(
-    os.getenv(
-        "MIN_SIGNAL_SCORE",
-        "70"
-    )
-)
+# =========================
+# TELEGRAM SETTINGS
+# =========================
 
+TELEGRAM_TOKEN = "ضع_توكن_البوت_هنا"
 
-LOT = 0.01
+TELEGRAM_CHAT_ID = "ضع_ID_هنا"
+
 
 
 # =========================
-# MARKETS
+# SYMBOLS
+# الأسواق التي يراقبها البوت
 # =========================
 
 SYMBOLS = {
 
-    "XAUUSD": "XAU/USD",
+    # المعادن
+    "GOLD": "GC=F",
 
-    "EURUSD": "EUR/USD",
+    # العملات الرقمية
+    "BTC": "BTC-USD",
 
-    "GBPUSD": "GBP/USD",
+    # المؤشرات العالمية
+    "US100": "^NDX",
+    "US30": "^DJI",
+    "GER40": "^GDAXI",
 
-    "USDJPY": "USD/JPY",
-
-    "BTCUSD": "BTC/USD",
-
-    "US100": "IXIC",
-
-    "US30": "DJI",
-
-    "GER40": "DAX",
-
-    "WTI": "WTI"
-
+    # العملات الرئيسية Forex
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDCAD": "CAD=X",
+    "USDCHF": "CHF=X",
+    "NZDUSD": "NZDUSD=X"
 }
 
 
+
 # =========================
-# TELEGRAM
+# DATA SETTINGS
 # =========================
 
-def send_text(message):
+TIMEFRAME = "30m"
+PERIOD = "10d"
 
-    if not BOT_TOKEN or not CHAT_ID:
-        return
 
+
+# =========================
+# SEND TELEGRAM
+# =========================
+
+def send_telegram(message):
 
     url = (
-        "https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
-
-    try:
-
-        requests.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
-            timeout=15
-        )
-
-
-    except Exception as e:
-
-        logger.error(e)
-
-
-
-def send_image(path, caption):
-
-    if not BOT_TOKEN or not CHAT_ID:
-        return
-
-
-    url = (
-        "https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendPhoto"
-    )
-
-
-    try:
-
-        with open(path, "rb") as img:
-
-            requests.post(
-                url,
-                data={
-                    "chat_id": CHAT_ID,
-                    "caption": caption
-                },
-                files={
-                    "photo": img
-                },
-                timeout=30
-            )
-
-
-    except Exception as e:
-
-        logger.error(e)
-
-
-
-# =========================
-# TWELVE DATA CANDLES
-# =========================
-
-def get_candles(symbol):
-
-    url = "https://api.twelvedata.com/time_series"
-
-
-    params = {
-
-        "symbol": symbol,
-
-        "interval": "1h",
-
-        "outputsize": 200,
-
-        "apikey": TWELVE_API_KEY
-
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
     }
 
+    try:
+        response = requests.post(
+            url,
+            data=data,
+            timeout=10
+        )
+
+        return response.json()
+
+    except Exception as e:
+        logging.error(
+            f"Telegram Error: {e}"
+        )
+
+        return None
+
+
+
+# =========================
+# GET MARKET DATA
+# =========================
+
+def get_data(symbol):
 
     try:
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20
+        df = yf.download(
+            symbol,
+            period=PERIOD,
+            interval=TIMEFRAME,
+            progress=False
         )
 
 
-        data = response.json()
-
-
-        if "values" not in data:
-
-            logger.warning(
-                f"No data {symbol}: {data}"
+        if df.empty:
+            logging.warning(
+                f"No data for {symbol}"
             )
-
             return None
 
 
-
-        df = pd.DataFrame(
-            data["values"]
-        )
-
-
-        df = df.rename(
-            columns={
-
-                "datetime": "time",
-
-                "open": "open",
-
-                "high": "high",
-
-                "low": "low",
-
-                "close": "close"
-
-            }
-        )
-
-
-        for col in [
-            "open",
-            "high",
-            "low",
-            "close"
-        ]:
-
-            df[col] = (
-                pd.to_numeric(
-                    df[col]
-                )
-            )
-
-
-        df = df.sort_values(
-            "time"
-        )
-
+        df.dropna(inplace=True)
 
         return df
 
 
-
     except Exception as e:
 
-        logger.error(
-            f"API ERROR {symbol}: {e}"
+        logging.error(
+            f"Data Error {symbol}: {e}"
         )
 
         return None
         # =========================
-# INDICATORS
+# TECHNICAL INDICATORS
 # =========================
+
 
 def add_indicators(df):
 
-    df["EMA20"] = (
-        df["close"]
-        .ewm(span=20)
-        .mean()
-    )
+    # =====================
+    # EMA TREND
+    # =====================
 
     df["EMA50"] = (
-        df["close"]
-        .ewm(span=50)
+        df["Close"]
+        .ewm(span=50, adjust=False)
+        .mean()
+    )
+
+    df["EMA200"] = (
+        df["Close"]
+        .ewm(span=200, adjust=False)
         .mean()
     )
 
 
+    # =====================
     # RSI
+    # =====================
 
-    delta = df["close"].diff()
+    delta = df["Close"].diff()
+
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
 
 
-    gain = (
-        delta.clip(lower=0)
-        .rolling(14)
+    avg_gain = (
+        gain.rolling(14)
+        .mean()
+    )
+
+    avg_loss = (
+        loss.rolling(14)
         .mean()
     )
 
 
-    loss = (
-        -delta.clip(upper=0)
-        .rolling(14)
-        .mean()
-    )
-
-
-    rs = gain / loss
-
+    rs = avg_gain / avg_loss
 
     df["RSI"] = (
-        100 - (100/(1+rs))
+        100 - (100 / (1 + rs))
     )
 
 
+    # =====================
     # MACD
+    # =====================
 
     ema12 = (
-        df["close"]
-        .ewm(span=12)
+        df["Close"]
+        .ewm(
+            span=12,
+            adjust=False
+        )
         .mean()
     )
 
     ema26 = (
-        df["close"]
-        .ewm(span=26)
+        df["Close"]
+        .ewm(
+            span=26,
+            adjust=False
+        )
         .mean()
     )
 
 
-    df["MACD"] = (
-        ema12 - ema26
+    df["MACD"] = ema12 - ema26
+
+
+    df["MACD_SIGNAL"] = (
+        df["MACD"]
+        .ewm(
+            span=9,
+            adjust=False
+        )
+        .mean()
     )
 
 
-    # ATR
+    # =====================
+    # ATR (Volatility)
+    # =====================
 
     high_low = (
-        df["high"]
-        -
-        df["low"]
+        df["High"] - df["Low"]
+    )
+
+    high_close = (
+        abs(
+            df["High"] -
+            df["Close"].shift()
+        )
+    )
+
+    low_close = (
+        abs(
+            df["Low"] -
+            df["Close"].shift()
+        )
+    )
+
+
+    ranges = pd.concat(
+        [
+            high_low,
+            high_close,
+            low_close
+        ],
+        axis=1
+    )
+
+
+    true_range = (
+        ranges.max(axis=1)
     )
 
 
     df["ATR"] = (
-        high_low
+        true_range
         .rolling(14)
         .mean()
     )
@@ -335,368 +276,709 @@ def add_indicators(df):
 
 
 # =========================
-# ANALYSIS
+# SUPPORT & RESISTANCE
 # =========================
 
-def analyze(df):
+
+def get_levels(df):
+
+    recent = df.tail(50)
+
+
+    support = (
+        recent["Low"]
+        .min()
+    )
+
+
+    resistance = (
+        recent["High"]
+        .max()
+    )
+
+
+    return support, resistance
+    # =========================
+# SIGNAL ENGINE
+# =========================
+
+
+def analyze_market(df, name):
 
     df = add_indicators(df)
-
 
     last = df.iloc[-1]
 
 
-    score = 0
-
-    reasons = []
-
-
-    price = float(
-        last["close"]
-    )
+    score_buy = 0
+    score_sell = 0
 
 
-    # Trend
+    reasons_buy = []
+    reasons_sell = []
 
-    if last["EMA20"] > last["EMA50"]:
 
-        direction = "BUY"
 
-        score += 30
+    # =====================
+    # TREND FILTER EMA
+    # =====================
 
-        reasons.append(
-            "Trend صاعد"
-        )
-
+    if last["Close"] > last["EMA50"]:
+        score_buy += 1
+        reasons_buy.append("السعر فوق EMA50")
 
     else:
+        score_sell += 1
+        reasons_sell.append("السعر تحت EMA50")
 
-        direction = "SELL"
 
-        score += 30
 
-        reasons.append(
-            "Trend هابط"
+    if last["EMA50"] > last["EMA200"]:
+        score_buy += 2
+        reasons_buy.append("اتجاه صاعد قوي")
+
+    elif last["EMA50"] < last["EMA200"]:
+        score_sell += 2
+        reasons_sell.append("اتجاه هابط قوي")
+
+
+
+    # =====================
+    # RSI FILTER
+    # =====================
+
+    if 40 < last["RSI"] < 70:
+
+        score_buy += 1
+        reasons_buy.append(
+            "RSI يدعم الصعود"
+        )
+
+    elif 30 < last["RSI"] < 60:
+
+        score_sell += 1
+        reasons_sell.append(
+            "RSI يدعم الهبوط"
         )
 
 
 
-    # RSI
+    # =====================
+    # MACD CONFIRMATION
+    # =====================
 
-    rsi = float(
-        last["RSI"]
-    )
+    if last["MACD"] > last["MACD_SIGNAL"]:
 
-
-    if direction == "BUY" and rsi > 50:
-
-        score += 20
-
-        reasons.append(
-            "RSI داعم للشراء"
-        )
-
-
-    elif direction == "SELL" and rsi < 50:
-
-        score += 20
-
-        reasons.append(
-            "RSI داعم للبيع"
-        )
-
-
-
-    # MACD
-
-    macd = float(
-        last["MACD"]
-    )
-
-
-    if direction == "BUY" and macd > 0:
-
-        score += 20
-
-        reasons.append(
+        score_buy += 2
+        reasons_buy.append(
             "MACD إيجابي"
         )
 
+    else:
 
-    elif direction == "SELL" and macd < 0:
-
-        score += 20
-
-        reasons.append(
+        score_sell += 2
+        reasons_sell.append(
             "MACD سلبي"
         )
 
 
 
-    # Candle confirmation
+    # =====================
+    # FINAL DECISION
+    # =====================
 
-    if last["close"] > last["open"]:
+    confidence = max(
+        score_buy,
+        score_sell
+    )
 
-        score += 10
 
-        reasons.append(
-            "شمعة صاعدة"
-        )
+    if score_buy >= 5:
+
+        signal = "BUY"
+        reasons = reasons_buy
+
+
+    elif score_sell >= 5:
+
+        signal = "SELL"
+        reasons = reasons_sell
+
 
     else:
 
-        score += 10
+        signal = "WAIT"
+        reasons = [
+            "لا توجد شروط كافية للدخول"
+        ]
 
-        reasons.append(
-            "شمعة هابطة"
-        )
 
 
-    return {
+    support, resistance = get_levels(df)
 
-        "direction": direction,
+
+    result = {
+
+        "symbol": name,
+
+        "signal": signal,
+
+        "confidence": confidence,
 
         "price": round(
-            price,
+            float(last["Close"]),
             5
         ),
 
-        "score": round(
-            score,
-            1
+        "rsi": round(
+            float(last["RSI"]),
+            2
         ),
 
-        "reasons": reasons,
+        "support": round(
+            float(support),
+            5
+        ),
 
-        "df": df
+        "resistance": round(
+            float(resistance),
+            5
+        ),
+
+        "reasons": reasons
 
     }
 
 
+    return result
+    # =========================
+# FORMAT SIGNAL MESSAGE
+# =========================
+
+
+def format_message(result):
+
+    if result["signal"] == "WAIT":
+        return None
+
+
+    emoji = "🟢" if result["signal"] == "BUY" else "🔴"
+
+
+    message = f"""
+<b>📊 PRO MAX SIGNAL</b>
+
+{emoji} <b>{result['signal']}</b>
+━━━━━━━━━━━━━━
+
+📌 الأصل: {result['symbol']}
+
+💰 السعر:
+{result['price']}
+
+📈 قوة الإشارة:
+{result['confidence']}/7
+
+📊 RSI:
+{result['rsi']}
+
+🟦 الدعم:
+{result['support']}
+
+🟥 المقاومة:
+{result['resistance']}
+
+
+<b>التحليل:</b>
+"""
+
+
+    for reason in result["reasons"]:
+        message += f"\n✅ {reason}"
+
+
+    message += """
+
+━━━━━━━━━━━━━━
+⚠️ إشارة تحليلية فقط
+إدارة رأس المال ضرورية
+"""
+
+
+    return message
+
+
 
 # =========================
-# SL TP
+# SCANNER
 # =========================
 
-def calculate_levels(
-    price,
-    direction
-):
 
-    distance = price * 0.003
+def scan_markets():
 
 
-    if direction == "BUY":
+    for name, symbol in SYMBOLS.items():
 
-        return (
+        logging.info(
+            f"Analyzing {name}"
+        )
 
-            price,
 
-            price-distance,
+        data = get_data(symbol)
 
-            price+(distance*2),
 
-            price+(distance*3)
+        if data is None:
+            continue
 
+
+        result = analyze_market(
+            data,
+            name
+        )
+
+
+        message = format_message(
+            result
+        )
+
+
+        if message:
+
+            send_telegram(
+                message
+            )
+
+            logging.info(
+                f"Signal sent {name}"
+            )
+
+
+
+# =========================
+# MAIN LOOP
+# =========================
+
+
+if __name__ == "__main__":
+
+
+    while True:
+
+        try:
+
+            scan_markets()
+
+
+            # إعادة الفحص كل 30 دقيقة
+
+            time.sleep(
+                1800
+            )
+
+
+        except Exception as e:
+
+            logging.error(e)
+
+            time.sleep(
+                60
+            )
+            # =========================
+# SIGNAL MEMORY
+# منع تكرار نفس الإشارة
+# =========================
+
+last_signals = {}
+
+
+def check_duplicate(symbol, signal):
+
+    key = symbol
+
+    if key in last_signals:
+
+        if last_signals[key] == signal:
+            return True
+
+
+    last_signals[key] = signal
+
+    return False
+
+
+
+# =========================
+# RISK MANAGEMENT
+# ATR BASED SL / TP
+# =========================
+
+
+def calculate_targets(df, signal):
+
+    last = df.iloc[-1]
+
+
+    price = float(last["Close"])
+
+    atr = float(last["ATR"])
+
+
+    if signal == "BUY":
+
+        stop_loss = price - (atr * 2)
+
+        take_profit = price + (atr * 3)
+
+
+    else:
+
+        stop_loss = price + (atr * 2)
+
+        take_profit = price - (atr * 3)
+
+
+
+    return (
+        round(stop_loss, 5),
+        round(take_profit, 5)
+    )
+
+
+
+# =========================
+# VIP ANALYSIS
+# =========================
+
+
+def vip_analyze(df, name):
+
+    df = add_indicators(df)
+
+
+    result = analyze_market(
+        df,
+        name
+    )
+
+
+    if result["signal"] != "WAIT":
+
+
+        if check_duplicate(
+            name,
+            result["signal"]
+        ):
+
+            result["signal"] = "WAIT"
+
+
+
+    if result["signal"] != "WAIT":
+
+
+        sl, tp = calculate_targets(
+            df,
+            result["signal"]
+        )
+
+
+        result["stop_loss"] = sl
+
+        result["take_profit"] = tp
+
+
+    return result
+
+
+
+# =========================
+# VIP MESSAGE
+# =========================
+
+
+def vip_message(result):
+
+
+    if result["signal"] == "WAIT":
+
+        return None
+
+
+
+    emoji = (
+        "🟢"
+        if result["signal"] == "BUY"
+        else "🔴"
+    )
+
+
+    text = f"""
+
+<b>👑 PRO MAX VIP SIGNAL</b>
+
+{emoji} <b>{result['signal']}</b>
+
+━━━━━━━━━━━━
+
+📌 الأصل:
+{result['symbol']}
+
+💰 الدخول:
+{result['price']}
+
+🛑 وقف الخسارة:
+{result['stop_loss']}
+
+🎯 الهدف:
+{result['take_profit']}
+
+
+📊 الثقة:
+{result['confidence']}/7
+
+📈 RSI:
+{result['rsi']}
+
+
+<b>التحليل:</b>
+"""
+
+
+    for r in result["reasons"]:
+
+        text += f"\n✅ {r}"
+
+
+    text += """
+
+━━━━━━━━━━━━
+
+⚠️ ليست توصية مالية
+"""
+
+
+    return text
+    # =========================
+# VIP MARKET SCANNER
+# =========================
+
+
+def scan_markets():
+
+
+    for name, symbol in SYMBOLS.items():
+
+
+        logging.info(
+            f"VIP Scanning: {name}"
+        )
+
+
+        data = get_data(symbol)
+
+
+        if data is None:
+            continue
+
+
+
+        try:
+
+            result =# =========================
+# FINAL VIP ANALYSIS
+# =========================
+
+
+def vip_analyze(df, name):
+
+
+    # التحليل الأساسي
+
+    df = add_indicators(df)
+
+
+    result = analyze_market(
+        df,
+        name
+    )
+
+
+    # فلتر الجودة المتقدم
+
+    result = quality_check(
+        df,
+        result,
+        SYMBOLS[name]
+    )
+
+
+
+    # إذا أصبحت الإشارة ضعيفة
+
+    if result["signal"] == "WAIT":
+
+        return result
+
+
+
+    # منع تكرار الإشارة
+
+    if check_duplicate(
+        name,
+        result["signal"]
+    ):
+
+        result["signal"] = "WAIT"
+
+        return result
+
+
+
+    # حساب الهدف ووقف الخسارة
+
+    sl, tp =# =========================
+# SMART SL / TP SYSTEM
+# حسب نوع السوق
+# =========================
+
+
+def calculate_targets(df, signal, name):
+
+
+    last = df.iloc[-1]
+
+
+    price = float(
+        last["Close"]
+    )
+
+
+    atr = float(
+        last["ATR"]
+    )
+
+
+    settings = get_market_setting(
+        name
+    )
+
+
+    sl_multiplier = settings["atr_sl"]
+
+    tp_multiplier = settings["atr_tp"]
+
+
+
+    if signal == "BUY":
+
+
+        stop_loss = (
+            price -
+            (atr * sl_multiplier)
+        )
+
+
+        take_profit = (
+            price +
+            (atr * tp_multiplier)
+        )
+
+
+
+    elif signal == "SELL":
+
+
+        stop_loss = (
+            price +
+            (atr * sl_multiplier)
+        )
+
+
+        take_profit = (
+            price -
+            (atr * tp_multiplier)
         )
 
 
     else:
 
-        return (
+        return None, None
 
-            price,
 
-            price+distance,
 
-            price-(distance*2),
+    return (
 
-            price-(distance*3)
+        round(
+            stop_loss,
+            5
+        ),
 
+        round(
+            take_profit,
+            5
         )
 
-
-
-# =========================
-# CHART
-# =========================
-
-def create_chart(
-    df,
-    symbol,
-    direction
-):
-
-    path = (
-        f"/tmp/{symbol}.png"
+    ) (
+        df,
+        result["signal"]
     )
 
 
-    plt.figure(
-        figsize=(12,6)
-    )
+    result["stop_loss"] = sl
 
-
-    plt.plot(
-        df["close"],
-        label="Price"
-    )
-
-
-    plt.plot(
-        df["EMA20"],
-        label="EMA20"
-    )
-
-
-    plt.plot(
-        df["EMA50"],
-        label="EMA50"
-    )
-
-
-    plt.title(
-        f"{symbol} {direction}"
-    )
-
-
-    plt.legend()
-
-
-    plt.grid()
-
-
-    plt.savefig(
-        path,
-        bbox_inches="tight"
-    )
-
-
-    plt.close()
-
-
-    return path
-    # =========================
-# MARKET SCANNER
-# =========================
-
-def scan_market():
-
-    for name, symbol in SYMBOLS.items():
-
-        logger.info(
-            f"Checking {name}"
-        )
-
-
-        df = get_candles(symbol)
-
-
-        if df is None:
-
-            continue
-
-
-        result = analyze(df)
-
-
-        if result["score"] < MIN_SIGNAL:
-
-            continue
+    result["take_profit"] = tp
 
 
 
-        entry, sl, tp1, tp2 = calculate_levels(
-
-            result["price"],
-
-            result["direction"]
-
-        )
+    return result (
+                data,
+                name
+            )
 
 
-
-        message = f"""
-⭐ ProMax VIP SIGNAL
-
-📌 {name}
-
-🟢 {result['direction']}
-
-💰 Price:
-{result['price']}
-
-📊 Strength:
-{result['score']}%
-
-📦 Lot:
-{LOT}
-
-🎯 Entry:
-{entry}
-
-🛑 Stop Loss:
-{sl}
-
-✅ TP1:
-{tp1}
-
-✅ TP2:
-{tp2}
+            message = vip_message(
+                result
+            )
 
 
-📈 Analysis:
-"""
+            if message:
 
 
-        for item in result["reasons"]:
+                send_telegram(
+                    message
+                )
 
-            message += (
-                f"\n✅ {item}"
+
+                logging.info(
+                    f"VIP Signal Sent: {name}"
+                )
+
+
+            else:
+
+                logging.info(
+                    f"No valid signal: {name}"
+                )
+
+
+        except Exception as e:
+
+            logging.error(
+                f"Analysis error {name}: {e}"
             )
 
 
 
-        chart = create_chart(
-
-            result["df"],
-
-            name,
-
-            result["direction"]
-
-        )
-
-
-        send_image(
-
-            chart,
-
-            message
-
-        )
-
-
-
 # =========================
-# START LOOP
+# START BOT
 # =========================
 
-def main():
 
-    logger.info(
-        "⭐ ProMax VIP Started"
+def start_bot():
+
+    logging.info(
+        "PRO MAX VIP BOT STARTED"
     )
-
-
-    if not TWELVE_API_KEY:
-
-        logger.error(
-            "Missing TWELVE_API_KEY"
-        )
-
-        return
-
 
 
     while True:
@@ -704,20 +986,25 @@ def main():
 
         try:
 
-            scan_market()
+            scan_markets()
+
+
+            # فحص كل 30 دقيقة
+
+            time.sleep(
+                1800
+            )
 
 
         except Exception as e:
 
-            logger.error(
-                f"ERROR: {e}"
+
+            logging.error(e)
+
+
+            time.sleep(
+                60
             )
-
-
-
-        time.sleep(
-            CHECK_INTERVAL
-        )
 
 
 
@@ -727,4 +1014,309 @@ def main():
 
 if __name__ == "__main__":
 
-    main()
+    start_bot()
+    # =========================
+# ADVANCED FILTERS
+# =========================
+
+
+def candle_confirmation(df, signal):
+
+    last = df.iloc[-1]
+    previous = df.iloc[-2]
+
+
+    # شمعة صاعدة قوية
+
+    bullish = (
+        last["Close"] > last["Open"]
+        and
+        last["Close"] > previous["Close"]
+    )
+
+
+    # شمعة هابطة قوية
+
+    bearish = (
+        last["Close"] < last["Open"]
+        and
+        last["Close"] < previous["Close"]
+    )
+
+
+    if signal == "BUY" and bullish:
+        return True
+
+
+    if signal == "SELL" and bearish:
+        return True
+
+
+    return False
+
+
+
+# =========================
+# HIGHER TIMEFRAME TREND
+# =========================
+
+
+def higher_timeframe_filter(symbol, signal):
+
+    try:
+
+        df = yf.download(
+            symbol,
+            period="30d",
+            interval="1h",
+            progress=False
+        )
+
+
+        if df.empty:
+            return False
+
+
+        ema50 = (
+            df["Close"]
+            .ewm(span=50)
+            .mean()
+            .iloc[-1]
+        )
+
+
+        ema200 = (
+            df["Close"]
+            .ewm(span=200)
+            .mean()
+            .iloc[-1]
+        )
+
+
+        price = (
+            float(df["Close"].iloc[-1])
+        )
+
+
+        if signal == "BUY":
+
+            return (
+                price > ema50
+                and ema50 > ema200
+            )
+
+
+        if signal == "SELL":
+
+            return (
+                price < ema50
+                and ema50 < ema200
+            )
+
+
+    except Exception:
+
+        return False
+
+
+
+    return False
+
+
+
+# =========================
+# FINAL QUALITY CHECK
+# =========================
+
+
+def quality_check(df, result, symbol):
+
+
+    if result["signal"] == "WAIT":
+
+        return result
+
+
+
+    score = result["confidence"]
+
+
+
+    # تأكيد الشمعة
+
+    if candle_confirmation(
+        df,
+        result["signal"]
+    ):
+
+        score += 1
+
+        result["reasons"].append(
+            "تأكيد حركة الشمعة"
+        )
+
+
+    else:
+
+        score -= 1
+
+
+
+    # اتجاه الساعة
+
+    if higher_timeframe_filter(
+        symbol,
+        result["signal"]
+    ):
+
+        score += 2
+
+        result["reasons"].append(
+            "اتجاه الساعة مؤكد"
+        )
+
+    else:
+
+        score -= 1
+
+
+
+    result["confidence"] = score
+
+
+
+    # لا نرسل إلا القوي
+
+    if score < 6:
+
+        result["signal"] = "WAIT"
+
+
+
+    return result
+    # =========================
+# MARKET SETTINGS
+# إعدادات خاصة لكل سوق
+# =========================
+
+
+MARKET_SETTINGS = {
+
+
+    # الذهب
+    "GOLD": {
+
+        "min_score": 6,
+        "atr_sl": 2.2,
+        "atr_tp": 3.5
+    },
+
+
+    # البيتكوين
+    "BTC": {
+
+        "min_score": 7,
+        "atr_sl": 2.8,
+        "atr_tp": 4
+    },
+
+
+    # المؤشرات
+    "US100": {
+
+        "min_score": 6,
+        "atr_sl": 2,
+        "atr_tp": 3
+    },
+
+    "US30": {
+
+        "min_score": 6,
+        "atr_sl": 2,
+        "atr_tp": 3
+    },
+
+
+    "GER40": {
+
+        "min_score": 6,
+        "atr_sl": 2,
+        "atr_tp": 3
+    },
+
+
+    # العملات الرئيسية
+
+    "EURUSD": {
+
+        "min_score": 6,
+        "atr_sl": 1.8,
+        "atr_tp": 2.8
+    },
+
+    "GBPUSD": {
+
+        "min_score": 6,
+        "atr_sl": 2,
+        "atr_tp": 3
+    },
+
+
+    "USDJPY": {
+
+        "min_score": 6,
+        "atr_sl": 1.8,
+        "atr_tp": 2.8
+    },
+
+
+    "AUDUSD": {
+
+        "min_score": 6,
+        "atr_sl": 1.8,
+        "atr_tp": 2.8
+    },
+
+
+    "USDCAD": {
+
+        "min_score": 6,
+        "atr_sl": 1.8,
+        "atr_tp": 2.8
+    },
+
+
+    "USDCHF": {
+
+        "min_score": 6,
+        "atr_sl": 1.8,
+        "atr_tp": 2.8
+    },
+
+
+    "NZDUSD": {
+
+        "min_score": 6,
+        "atr_sl": 1.8,
+        "atr_tp": 2.8
+    }
+
+}
+
+
+
+# =========================
+# GET MARKET CONFIG
+# =========================
+
+
+def get_market_setting(name):
+
+    return MARKET_SETTINGS.get(
+        name,
+        {
+            "min_score": 6,
+            "atr_sl": 2,
+            "atr_tp": 3
+        }
+    )
