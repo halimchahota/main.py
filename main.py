@@ -38,6 +38,11 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "100"))
 RISK_PCT = float(os.getenv("RISK_PCT", "3"))
 
+M5_CONFIRMATION = os.getenv("M5_CONFIRMATION", "1") == "1"
+USE_LIQUIDITY_SWEEP = os.getenv("USE_LIQUIDITY_SWEEP", "1") == "1"
+LIQUIDITY_LOOKBACK = int(os.getenv("LIQUIDITY_LOOKBACK", "30"))
+USE_SUPPLY_DEMAND = os.getenv("USE_SUPPLY_DEMAND", "1") == "1"
+USE_VOLUME_CONFIRMATION = os.getenv("USE_VOLUME_CONFIRMATION", "1") == "1"
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "45"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "25"))
 
