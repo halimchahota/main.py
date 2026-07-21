@@ -95,8 +95,7 @@ LEARN_RATE_LOSS = float(os.getenv("LEARN_RATE_LOSS", "0.08"))
 LEARN_RATE_BE = float(os.getenv("LEARN_RATE_BE", "0.02"))
 WEIGHT_MIN = float(os.getenv("WEIGHT_MIN", "0.40"))
 WEIGHT_MAX = float(os.getenv("WEIGHT_MAX", "2.40"))
-# ===
-======================
+# =========================
 # TRADE STORAGE
 # =========================
 
@@ -112,6 +111,56 @@ stats = {
     "tp2": 0,
     "tp3": 0
 }
+
+
+def save_trades():
+    data = {
+        "open_trades": open_trades,
+        "closed_trades": closed_trades,
+        "stats": stats
+    }
+
+    with open(TRADES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def load_trades():
+    global open_trades, closed_trades, stats
+
+    if not TRADES_FILE.exists():
+        save_trades()
+        return
+
+    with open(TRADES_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    open_trades = data.get("open_trades", [])
+    closed_trades = data.get("closed_trades", [])
+    stats = data.get("stats", stats)
+
+
+def add_trade(symbol, side, entry, sl, tp1, tp2, tp3, score):
+
+    trade = {
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "score": score,
+        "status": "OPEN",
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "opened_at": datetime.utcnow().isoformat()
+    }
+
+    open_trades.append(trade)
+    stats["signals"] += 1
+
+    save_trades()
 SYMBOLS: Dict[str, str] = {
     "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
     "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
