@@ -17,6 +17,11 @@ import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import json
+from pathlib import Path
+from datetime import datetime
+
+TRADES_FILE = Path("trades.json")
 
 
 # =========================
@@ -90,7 +95,23 @@ LEARN_RATE_LOSS = float(os.getenv("LEARN_RATE_LOSS", "0.08"))
 LEARN_RATE_BE = float(os.getenv("LEARN_RATE_BE", "0.02"))
 WEIGHT_MIN = float(os.getenv("WEIGHT_MIN", "0.40"))
 WEIGHT_MAX = float(os.getenv("WEIGHT_MAX", "2.40"))
+# ===
+======================
+# TRADE STORAGE
+# =========================
 
+open_trades = []
+closed_trades = []
+
+stats = {
+    "signals": 0,
+    "closed": 0,
+    "wins": 0,
+    "losses": 0,
+    "tp1": 0,
+    "tp2": 0,
+    "tp3": 0
+}
 SYMBOLS: Dict[str, str] = {
     "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
     "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
