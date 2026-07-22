@@ -337,7 +337,89 @@ def update_weights_after_trade(state: dict, label: str, features_used: dict, out
 
         state["weights_global"][k] = clamp(g + (delta * 0.35), WEIGHT_MIN, WEIGHT_MAX)
         state["weights_symbol"][label][k] = clamp(s + (delta * 0.65), WEIGHT_MIN, WEIGHT_MAX)
+# =========================
+# TRADE MONITOR
+# =========================
 
+def close_trade(trade, result):
+    trade["status"] = "CLOSED"
+    trade["closed_at"] = datetime.utcnow().isoformat()
+    trade["result"] = result
+
+    closed_trades.append(trade)
+    open_trades.remove(trade)
+
+    stats["closed"] += 1
+
+    if result == "WIN":
+        stats["wins"] += 1
+    elif result == "LOSS":
+        stats["losses"] += 1
+
+    save_trades()
+
+
+def monitor_trades():
+
+    for trade in open_trades.copy():
+
+        symbol = trade["symbol"]
+
+        try:
+            df_price = yf_download_safe(
+                SYMBOLS[symbol],
+                "5d",
+                "5m"
+            )
+
+            if df_price is None or df_price.empty:
+                continue
+
+            price = float(df_price["Close"].iloc[-1])
+
+        except Exception as e:
+            logger.error(f"Monitor error {symbol}: {e}")
+            continue
+
+
+        if trade["side"] == "BUY":
+
+            if price >= trade["tp1"] and not trade["tp1_hit"]:
+                trade["tp1_hit"] = True
+                stats["tp1"] += 1
+
+            if price >= trade["tp2"] and not trade["tp2_hit"]:
+                trade["tp2_hit"] = True
+                stats["tp2"] += 1
+
+            if price >= trade["tp3"]:
+                stats["tp3"] += 1
+                close_trade(trade, "WIN")
+                continue
+
+            if price <= trade["sl"]:
+                close_trade(trade, "LOSS")
+                continue
+
+
+        elif trade["side"] == "SELL":
+
+            if price <= trade["tp1"] and not trade["tp1_hit"]:
+                trade["tp1_hit"] = True
+                stats["tp1"] += 1
+
+            if price <= trade["tp2"] and not trade["tp2_hit"]:
+                trade["tp2_hit"] = True
+                stats["tp2"] += 1
+
+            if price <= trade["tp3"]:
+                stats["tp3"] += 1
+                close_trade(trade, "WIN")
+                continue
+
+            if price >= trade["sl"]:
+                close_trade(trade, "LOSS")
+                continue
 
 # =========================
 # TELEGRAM
@@ -1829,8 +1911,9 @@ load_trades()
     while True:
         try:
             update_trade_outcomes(state)
-            maybe_send_daily_report(state)
-
+            maybe_send_daily_report(state).
+            monitor_trades()
+            
             offset = int(state.get("tg_offset", 0))
             upd = tg_get_updates(offset)
             if upd.get("ok") and upd.get("result"):
