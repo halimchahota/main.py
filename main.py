@@ -1937,12 +1937,6 @@ while True:
 
     time.sleep(CHECK_INTERVAL_SEC)
 
-            now = time.time()
-            if now - last_check < CHECK_INTERVAL_SEC:
-                time.sleep(1)
-                continue
-            last_check = now
-
             for label, sym in SYMBOLS.items():
                 if not market_is_open_for_symbol(label):
                     continue
