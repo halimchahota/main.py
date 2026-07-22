@@ -164,7 +164,7 @@ def add_trade(symbol, side, entry, sl, tp1, tp2, tp3, score):
 SYMBOLS: Dict[str, str] = {
     "XAU": os.getenv("XAU_SYMBOL", "GC=F"),
     "XAG": os.getenv("XAG_SYMBOL", "SI=F"),
-    "US100": os.getenv("US100_SYMBOL", "US100=CFD"),
+    "US100": os.getenv("US100_SYMBOL", "^NDX"),
     "US30": os.getenv("US30_SYMBOL", "^DJI"),
     "GER40": os.getenv("GER40_SYMBOL", "^GDAXI"),
     "OILCASH": os.getenv("OILCASH_SYMBOL", "CL=F"),
