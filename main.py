@@ -1891,14 +1891,11 @@ def main():
         logger.error("Missing BOT_TOKEN or CHAT_ID.")
         return
 
-    tg_delete_webhook()
-
     me = tg_get_me()
     bot_username = me.get("username") if me else None
     if bot_username:
         logger.info("Bot username: @%s", bot_username)
 
-    state = load_state()
     logger.info("Institutional Adaptive bot started | CHAT_ID=%s", CHAT_ID)
 
     tg_send_message(
@@ -1907,70 +1904,110 @@ def main():
     )
 
     last_check = 0.0
+    
+    tg_delete_webhook()
+
+    state = load_state()
+
     load_trades()
 
-while True:
-    try:
-        update_trade_outcomes(state)
+    while True:
+        try:
+            update_trade_outcomes(state)
 
-        maybe_send_daily_report(state)
+            maybe_send_daily_report(state)
 
-        monitor_trades()
+            monitor_trades()
 
-        offset = int(state.get("tg_offset", 0))
+            offset = int(state.get("tg_offset", 0))
 
-        upd = tg_get_updates(offset)
+            upd = tg_get_updates(offset)
 
-        if upd.get("ok") and upd.get("result"):
-            for u in upd["result"]:
-                state["tg_offset"] = u["update_id"] + 1
-                handle_command(state, u, bot_username)
+            if upd.get("ok") and upd.get("result"):
+                for u in upd["result"]:
+                    state["tg_offset"] = u["update_id"] + 1
+                    handle_command(state, u, bot_username)
 
-            save_state(state)
+                save_state(state)
 
-        if state.get("paused", False):
-            time.sleep(1)
-            continue
+            if state.get("paused", False):
+                time.sleep(1)
+                continue
 
-    except Exception as e:
-        logger.error(f"Main loop error: {e}")
-
-    time.sleep(CHECK_INTERVAL_SEC)
-    
 
             for label, sym in SYMBOLS.items():
+
                 if not market_is_open_for_symbol(label):
                     continue
+
                 if not session_allowed_for_symbol(label):
                     continue
 
+
                 plan = build_plan(state, label, sym)
+
                 if plan is None:
                     continue
+
                 if not should_send(state, plan):
                     continue
 
-                m30 = yf_download_safe(plan.symbol, LOOKBACK_M30, "30m")
+
+                m30 = yf_download_safe(
+                    plan.symbol,
+                    LOOKBACK_M30,
+                    "30m"
+                )
+
                 if m30 is None or m30.empty:
                     continue
 
-                tg_send_message(CHAT_ID, format_plan(plan))
+
+                tg_send_message(
+                    CHAT_ID,
+                    format_plan(plan)
+                )
+
+
                 try:
                     img = render_chart(m30, plan)
-                    ok = tg_send_photo(CHAT_ID, f"📉 Technical Chart - {plan.label}", img)
+
+                    ok = tg_send_photo(
+                        CHAT_ID,
+                        f"📉 Technical Chart - {plan.label}",
+                        img
+                    )
+
                     if not ok:
-                        tg_send_message(CHAT_ID, f"⚠️ تعذر إرسال الشارت لـ {plan.label}")
+                        tg_send_message(
+                            CHAT_ID,
+                            f"⚠️ تعذر إرسال الشارت لـ {plan.label}"
+                        )
+
                 except Exception as e:
-                    tg_send_message(CHAT_ID, f"⚠️ Chart error for {plan.label}: {e}")
+                    tg_send_message(
+                        CHAT_ID,
+                        f"⚠️ Chart error for {plan.label}: {e}"
+                    )
+
 
                 mark_sent(state, plan)
+
                 register_trade_for_daily(state, plan)
+
                 save_state(state)
+
                 time.sleep(1)
 
+
         except Exception as e:
-            logger.exception("Main loop error: %s", e)
+            logger.exception(
+                "Main loop error: %s",
+                e
+            )
+
             time.sleep(5)
+
 
 
 if __name__ == "__main__":
