@@ -1936,6 +1936,7 @@ while True:
         logger.error(f"Main loop error: {e}")
 
     time.sleep(CHECK_INTERVAL_SEC)
+    
 
             for label, sym in SYMBOLS.items():
                 if not market_is_open_for_symbol(label):
