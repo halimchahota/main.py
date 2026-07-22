@@ -1907,24 +1907,35 @@ def main():
     )
 
     last_check = 0.0
-load_trades()
-    while True:
-        try:
-            update_trade_outcomes(state)
-            maybe_send_daily_report(state).
-            monitor_trades()
-            
-            offset = int(state.get("tg_offset", 0))
-            upd = tg_get_updates(offset)
-            if upd.get("ok") and upd.get("result"):
-                for u in upd["result"]:
-                    state["tg_offset"] = u["update_id"] + 1
-                    handle_command(state, u, bot_username)
-                save_state(state)
+    load_trades()
 
-            if state.get("paused", False):
-                time.sleep(1)
-                continue
+while True:
+    try:
+        update_trade_outcomes(state)
+
+        maybe_send_daily_report(state)
+
+        monitor_trades()
+
+        offset = int(state.get("tg_offset", 0))
+
+        upd = tg_get_updates(offset)
+
+        if upd.get("ok") and upd.get("result"):
+            for u in upd["result"]:
+                state["tg_offset"] = u["update_id"] + 1
+                handle_command(state, u, bot_username)
+
+            save_state(state)
+
+        if state.get("paused", False):
+            time.sleep(1)
+            continue
+
+    except Exception as e:
+        logger.error(f"Main loop error: {e}")
+
+    time.sleep(CHECK_INTERVAL_SEC)
 
             now = time.time()
             if now - last_check < CHECK_INTERVAL_SEC:
