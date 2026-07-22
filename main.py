@@ -1825,7 +1825,7 @@ def main():
     )
 
     last_check = 0.0
-
+load_trades()
     while True:
         try:
             update_trade_outcomes(state)
