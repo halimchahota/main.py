@@ -1911,13 +1911,18 @@ def main():
 
     load_trades()
 
-    while True:
+        while True:
         try:
+
+            # تحديث حالة الصفقات المفتوحة أولاً
+            monitor_trades()
+
+            # تحديث نتائج الصفقات في النظام اليومي
             update_trade_outcomes(state)
 
+            # إرسال التقرير بعد تحديث النتائج
             maybe_send_daily_report(state)
 
-            monitor_trades()
 
             offset = int(state.get("tg_offset", 0))
 
@@ -1929,6 +1934,7 @@ def main():
                     handle_command(state, u, bot_username)
 
                 save_state(state)
+
 
             if state.get("paused", False):
                 time.sleep(1)
@@ -1948,6 +1954,7 @@ def main():
 
                 if plan is None:
                     continue
+
 
                 if not should_send(state, plan):
                     continue
@@ -1970,6 +1977,7 @@ def main():
 
 
                 try:
+
                     img = render_chart(m30, plan)
 
                     ok = tg_send_photo(
@@ -1984,7 +1992,9 @@ def main():
                             f"⚠️ تعذر إرسال الشارت لـ {plan.label}"
                         )
 
+
                 except Exception as e:
+
                     tg_send_message(
                         CHAT_ID,
                         f"⚠️ Chart error for {plan.label}: {e}"
@@ -1993,6 +2003,7 @@ def main():
 
                 mark_sent(state, plan)
 
+                # تسجيل الصفقة بعد الإرسال
                 register_trade_for_daily(state, plan)
 
                 save_state(state)
@@ -2001,6 +2012,7 @@ def main():
 
 
         except Exception as e:
+
             logger.exception(
                 "Main loop error: %s",
                 e
