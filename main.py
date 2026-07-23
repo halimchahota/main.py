@@ -1911,7 +1911,7 @@ def main():
 
     load_trades()
 
-        while True:
+    while True:
         try:
 
             # تحديث حالة الصفقات المفتوحة أولاً
